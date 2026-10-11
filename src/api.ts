@@ -1,3 +1,4 @@
+import { archivedContext, identifyHistoryEntry, isWorkingContext, protectWorkingContext } from "./context.js";
 import { REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, VERSION } from "./constants.js";
 
 export type Role = "system" | "user" | "assistant";
@@ -377,7 +378,7 @@ export async function agentTurn(
     effort?: string;
     tools?: unknown[];
     maxRounds?: number;
-    execute: (name: string, args: Record<string, unknown>) => Promise<{ ok: boolean; output: string }>;
+    execute: (name: string, args: Record<string, unknown>) => Promise<{ ok: boolean; output: string; historyEntry?: string }>;
   },
 ): Promise<string> {
   // 40 rounds ≈ a multi-minute build/setup job. The old cap of 8 made the
@@ -425,7 +426,9 @@ export async function agentTurn(
       handlers.onToolCall?.(call.name, call.args);
       const result = await options.execute(call.name, args);
       handlers.onToolResult?.(call.name, result.ok, result.output);
-      history.push({ role: "tool", tool_call_id: call.id, content: result.output });
+      const evidence: AgentMessage = { role: "tool", tool_call_id: call.id, content: result.output };
+      if (result.historyEntry) identifyHistoryEntry(evidence, result.historyEntry);
+      history.push(evidence);
     }
   }
   if (exhausted) {
@@ -444,7 +447,7 @@ export async function agentTurn(
  *    left intact; only old context is compressed. */
 const MAX_MSG_CHARS = 28_000;
 const MAX_HISTORY_CHARS = 96_000;
-const MAX_REQUEST_MESSAGES = 160;
+const MAX_REQUEST_MESSAGES = 159; // reserve one slot for recovered context
 
 /** Prepare only the wire copy. Completed chats and resumable sessions retain
  * their full text. Old saved chats may contain tool calls whose results were
@@ -464,17 +467,29 @@ export function prepareRequestHistory(history: AgentMessage[]): { messages: Agen
     }
     if (cut > 0) {
       const firstUser = history.findIndex((m) => m.role === "user");
-      selected = history.filter((m, i) => i >= cut || m.role === "system" || i === firstUser);
+      selected = history.filter((m, i) => i >= cut || m.role === "system" || i === firstUser || isWorkingContext(m));
     }
   }
   const resultIds = new Set(selected.filter((m) => m.role === "tool").map((m) => m.tool_call_id));
   const messages: AgentMessage[] = selected.map((m) => {
-    if (m.role !== "assistant" || !m.tool_calls) return { ...m };
+    if (m.role !== "assistant" || !m.tool_calls) {
+      const copy = { ...m };
+      return isWorkingContext(m) ? protectWorkingContext(copy) : copy;
+    }
     const calls = m.tool_calls.filter((call) => resultIds.has(call.id));
     return calls.length ? { ...m, tool_calls: calls } : { role: "assistant", content: m.content };
   });
-  trimHistory(messages);
-  return { messages, trimmed: selected.length !== history.length || messages.some((m, i) => m.content !== selected[i]!.content) };
+  trimHistory(messages, 84_000);
+  const trimmed = selected.length !== history.length || messages.some((m, i) => m.content !== selected[i]!.content);
+  const archive = trimmed ? archivedContext(history, selected, messages) : "";
+  if (archive) {
+    // Keep the initial system/task at the front and the current request at the
+    // end; memory excerpts are bounded and carry exact source references.
+    const firstUser = messages.findIndex(m => m.role === "user");
+    const position = firstUser >= 0 ? (firstUser === messages.length - 1 ? firstUser : firstUser + 1) : messages.filter(m => m.role === 'system').length;
+    messages.splice(position, 0, { role: "assistant", content: archive });
+  }
+  return { messages, trimmed };
 }
 
 /** Approx wire size of a message (content + any tool_calls payload). */
@@ -484,7 +499,7 @@ function msgSize(m: AgentMessage): number {
   return n + 4;
 }
 
-export function trimHistory(history: AgentMessage[]): void {
+export function trimHistory(history: AgentMessage[], budget = MAX_HISTORY_CHARS): void {
   // 1) hard per-message cap (protects against a single giant message).
   for (const m of history) {
     if (typeof m.content === "string" && m.content.length > MAX_MSG_CHARS) {
@@ -494,7 +509,7 @@ export function trimHistory(history: AgentMessage[]): void {
   // Account once, then subtract each reduction. Repeated full-history scans
   // here made trimming quadratic in long coding conversations.
   let total = history.reduce((n, m) => n + msgSize(m), 0);
-  if (total <= MAX_HISTORY_CHARS) return;
+  if (total <= budget) return;
   const shorten = (m: AgentMessage, content: string) => {
     total -= m.content.length - content.length;
     m.content = content;
@@ -505,7 +520,7 @@ export function trimHistory(history: AgentMessage[]): void {
   //    newest two tool results are left whole; the model usually needs them.
   const toolIdx = history.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
   for (const i of toolIdx.slice(0, Math.max(0, toolIdx.length - 2))) {
-    if (total <= MAX_HISTORY_CHARS) break;
+    if (total <= budget) break;
     const m = history[i]!;
     if (typeof m.content === "string" && m.content.length > 100) {
       shorten(m, m.content.slice(0, 80) + " …[old tool result trimmed]");
@@ -514,8 +529,9 @@ export function trimHistory(history: AgentMessage[]): void {
 
   // 3) still over budget? compress old assistant/user prose (oldest first),
   //    always keeping the system message (0) and the last 4 messages untouched.
-  for (let i = 1; i < history.length - 4 && total > MAX_HISTORY_CHARS; i++) {
+  for (let i = 1; i < history.length - 4 && total > budget; i++) {
     const m = history[i]!;
+    if (isWorkingContext(m)) continue;
     if (m.role === "tool") continue; // already handled above
     if (typeof m.content === "string" && m.content.length > 600) {
       shorten(m, m.content.slice(0, 300) + "\n…[earlier context trimmed]\n" + m.content.slice(-200));

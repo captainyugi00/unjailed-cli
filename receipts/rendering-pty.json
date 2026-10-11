@@ -1,0 +1,29 @@
+{
+  "fakeLocalApiOnly": true,
+  "customerMutations": 0,
+  "cases": {
+    "previous": {
+      "sourceChars": 55625,
+      "streamOutputBytes": 243609,
+      "streamFullScreenClears": 0,
+      "writingActivityVisible": true,
+      "all900CodeLinesPrinted": true,
+      "largeDraftOutputBytes": 167942,
+      "resizeClearsScrollback": true,
+      "terminalRows": 18,
+      "terminalColumns": 100
+    },
+    "current": {
+      "sourceChars": 55625,
+      "streamOutputBytes": 165085,
+      "streamFullScreenClears": 0,
+      "writingActivityVisible": true,
+      "all900CodeLinesPrinted": true,
+      "largeDraftOutputBytes": 2012,
+      "resizeClearsScrollback": false,
+      "terminalRows": 18,
+      "terminalColumns": 100
+    }
+  },
+  "streamOutputReductionPercent": 32.23
+}

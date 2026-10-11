@@ -32,12 +32,14 @@ function inline(text: string): string {
 /** A fenced code block drawn as a rounded box with a dim language label.
  *  `boxW` is the total visible width of the box (borders included); long code
  *  lines are wrapped to the inner width so the right border never blows out. */
-function codeBlock(code: string, lang: string, boxW: number): string[] {
+function codeBlock(code: string, lang: string, boxW: number, highlightCode = true): string[] {
   let body = code.replace(/\n+$/, "");
-  if (colorLevel > 0) {
+  // Automatic language detection tests many grammars and can stall on long
+  // generated files. Streaming previews never highlight; completed output
+  // highlights only an explicit supported language and a bounded code block.
+  if (highlightCode && colorLevel > 0 && body.length <= 32_000 && lang && supportsLanguage(lang)) {
     try {
-      const language = lang && supportsLanguage(lang) ? lang : undefined;
-      body = highlight(body, { language, ignoreIllegals: true });
+      body = highlight(body, { language: lang, ignoreIllegals: true });
     } catch {
       /* leave plain */
     }
@@ -115,7 +117,7 @@ function wrapAnsiLine(line: string, cols: number): string[] {
  * an unterminated code fence renders as the code block so far, a half-written
  * table or dangling emphasis just renders as text. Never throws.
  */
-export function renderMarkdown(src: string, opts: { width?: number } = {}): string {
+export function renderMarkdown(src: string, opts: { width?: number; highlightCode?: boolean } = {}): string {
   // Width is known while streaming; for the settled transcript it isn't passed,
   // so fall back to the live terminal width. Boxes are sized to fit inside it
   // (and capped) so Ink never has to wrap — and corrupt — a bordered line.
@@ -134,7 +136,7 @@ export function renderMarkdown(src: string, opts: { width?: number } = {}): stri
       const body: string[] = [];
       i++;
       while (i < lines.length && !lines[i]!.trim().startsWith(marker)) body.push(lines[i++]!);
-      out.push(...codeBlock(body.join("\n"), lang, boxW));
+      out.push(...codeBlock(body.join("\n"), lang, boxW, opts.highlightCode));
       continue;
     }
 

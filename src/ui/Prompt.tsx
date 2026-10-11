@@ -1,6 +1,7 @@
 import React, { useRef } from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import { theme } from "../theme.js";
+import { editorViewport } from "./stream-buffer.js";
 
 export interface EditorState {
   value: string;
@@ -17,6 +18,8 @@ export interface PromptProps {
   placeholder?: string;
   isActive: boolean;
   label?: string;
+  width?: number;
+  maxRows?: number;
 }
 
 const isShiftEnter = (input: string, key: Key) =>
@@ -54,7 +57,7 @@ function insert(s: EditorState, text: string): EditorState {
   return { value: s.value.slice(0, s.cursor) + text + s.value.slice(s.cursor), cursor: s.cursor + text.length };
 }
 
-export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onSpecialKey, mask, placeholder, isActive, label }: PromptProps) {
+export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onSpecialKey, mask, placeholder, isActive, label, width = 80, maxRows = 4 }: PromptProps) {
   // Several key events can arrive in one batch (e.g. a paste followed by an arrow key) before
   // React re-renders, so edits build on the latest state kept here, not the possibly stale prop.
   const latest = useRef(propState);
@@ -140,18 +143,19 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
   );
 
   const state = propState;
-  const shown = mask ? "•".repeat(state.value.length) : state.value;
   const prefix = label ?? "› ";
   const pad = " ".repeat(prefix.length);
-  const lines = renderWithCursor(shown, state.cursor, isActive, placeholder).split("\n");
+  const viewport = editorViewport(state.value, state.cursor, Math.max(4, width - prefix.length), maxRows);
+  const lines = viewport.lines.map((line) => renderWithCursor(mask ? "•".repeat(line.text.length) : line.text, line.cursor ?? 0, isActive && line.cursor !== null, state.value ? undefined : placeholder));
   return (
     <Box flexDirection="column">
       {lines.map((l, i) => (
-        <Text key={i}>
+        <Text key={i} wrap="truncate-end">
           {i === 0 ? theme.brand(prefix) : pad}
           {l}
         </Text>
       ))}
+      {viewport.hidden && maxRows > 1 && <Text wrap="truncate-end">{theme.dim("  ⋯ draft continues; full text preserved")}</Text>}
     </Box>
   );
 }

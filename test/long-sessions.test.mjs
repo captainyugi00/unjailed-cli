@@ -132,14 +132,63 @@ test("terminal keeps activity visible after text, waits for approval, and preser
     const saved = loadSession(listSessions()[0].id);
     assert.deepEqual(saved.messages.slice(0, session.messages.length), session.messages, "original long transcript remains on disk");
     assert.ok(saved.messages.every((m) => !m.tool_calls), "saved conversation has no orphan calls");
+    assert.equal(saved.toolHistory.length, 1);
+    assert.equal(saved.toolHistory[0].ok, false, "denied actions are archived as failed, not performed");
+    await submit(ui, "/remember Never remove the sapphire configuration");
+    await waitFor(() => loadSession(session.id)?.notes?.length === 1, "session note saves");
     await submit(ui, "Continue reading");
     await waitFor(() => requests.length === 3, "following turn");
     assert.ok(requests[2].body.messages.every((m) => !m.tool_calls && m.role !== "tool"), "following turn has a clean chat transcript");
-    send(requests[2], { content: "Finished." }, "stop");
+    assert.ok(requests[2].body.tools.some(t => t.function.name === "search_history"), "read-only exact history recovery is available");
+    assert.ok(requests[2].body.messages.some(m => m.content.includes("failed/skipped") && m.content.includes("Nothing executed")), "the next turn retains actual denied tool evidence");
+    assert.ok(requests[2].body.messages.some(m => m.content.includes("Never remove the sapphire configuration")), "pinned requirements stay in request context");
+    send(requests[2], { tool_calls: [{ index: 0, id: "history-test", function: { name: "search_history", arguments: JSON.stringify({ entry: "tool:" + saved.toolHistory[0].id, length: 12000 }) } }] }, "tool_calls");
     done(requests[2]);
+    await waitFor(() => requests.length === 4, "history retrieval completes");
+    const result = requests[3].body.messages.find(m => m.role === "tool" && m.tool_call_id === "history-test");
+    assert.match(result.content,/must-not-exist.txt/);
+    assert.match(result.content,/Nothing executed/);
+    assert.equal(fs.existsSync(path.join(home, "must-not-exist.txt")), false, "history recovery never performs an old action");
+    send(requests[3], { content: "Finished." }, "stop");
+    done(requests[3]);
     await waitFor(() => loadSession(session.id)?.messages.at(-1)?.content === "Finished.", "follow-up ends");
+    ui.unmount(); ui.cleanup();
+    const resumed = render(React.createElement(App, { startup: "continue" }));
+    try {
+      await sleep(200);
+      await submit(resumed, "Recover our previous skipped write");
+      await waitFor(() => requests.length === 5, "resumed request");
+      assert.ok(requests[4].body.messages.some(m => m.content.includes("Never remove the sapphire configuration")));
+      assert.ok(requests[4].body.messages.some(m => m.content.includes("failed/skipped") && m.content.includes("must-not-exist.txt")), "exact tool evidence persists across process-style resume");
+      send(requests[4], { content: "Recovered safely." }, "stop");
+      done(requests[4]);
+      await waitFor(() => loadSession(session.id)?.messages.at(-1)?.content === "Recovered safely.", "resumed save");
+    } finally { resumed.unmount(); resumed.cleanup(); }
   } finally {
     for (const request of requests) { try { request.controller.close(); } catch {} }
     ui.unmount(); ui.cleanup(); globalThis.fetch = oldFetch;
   }
+});
+
+test('a completed tool and its task survive a model error before any assistant prose', async () => {
+  writeConfig({ tools:'read', plan:false, fx:false });
+  const file=path.join(home,'read-before-error.txt');fs.writeFileSync(file,'unique cobalt evidence');
+  const oldFetch=globalThis.fetch;
+  let calls=0;
+  globalThis.fetch=async (url) => {
+    if(String(url).endsWith('/models'))return Response.json({data:[{id:'kimi-k3'}]});
+    calls++;
+    if(calls===1)return Response.json({choices:[{message:{tool_calls:[{id:'read-before-error',function:{name:'read_file',arguments:JSON.stringify({path:file})}}]}}]});
+    return Response.json({error:{message:'Local test model disconnected'}},{status:400});
+  };
+  const ui=render(React.createElement(App));
+  try {
+    await sleep(200);await submit(ui,'Read cobalt evidence');
+    await waitFor(()=>listSessions().some(meta=>meta.title==='Read cobalt evidence'),'failed response task saves');
+    const saved=loadSession(listSessions().find(meta=>meta.title==='Read cobalt evidence').id);
+    assert.equal(saved.messages[0].content,'Read cobalt evidence');
+    assert.equal(saved.toolHistory[0].ok,true);
+    assert.match(saved.toolHistory[0].output,/unique cobalt evidence/);
+    assert.equal(saved.messages.some(m=>m.role==='assistant'),false,'no invented assistant response');
+  } finally { ui.unmount();ui.cleanup();globalThis.fetch=oldFetch; }
 });

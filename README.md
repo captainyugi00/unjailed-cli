@@ -52,6 +52,7 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 | `/skills` | Switch skills on or off for this chat (Space toggles). `/skills <name>` toggles one; `/skills new <name>` creates one. |
 | `/tools` | Agent tools. No argument: the model can read files and list directories. `cmds` enables file changes, launches and commands with approval for each action; `yolo` skips asking; `off` disables. |
 | `/api` | Show the base URL, masked key and current model, and run a live connection check. |
+| `/remember [text\|clear]` | Pin an important instruction for this session. No argument shows your notes; `clear` removes them. Saved notes return with `/resume`. |
 | `/context` | Show token usage for this chat: current context size, the last turn's prompt/completion tokens, message count and model. Numbers come from the API (or a `~` estimate if the server sends none). The context size also shows live in the status line as `ctx 12.4k`. |
 | `/fun` | Toggle the fun effects — the startup wink, side snow and finish sparkle. `/fun off` turns them off; the choice is saved. Effects are off automatically when output is piped, `NO_COLOR` is set, or the terminal is small. |
 | `/update` | Update the CLI to the latest version from npm. |
@@ -81,9 +82,22 @@ messages; the initial task, system instructions, recent turns and complete live
 tool-call/result groups are retained. These are targets: a large active tool
 group or protected recent turn can exceed them. The CLI tells you when older
 request text was shortened or omitted. Your full chat text stays in the current
-session and in saved chats; this is not a model-generated summary, so older
-details may need to be repeated. `/clear` starts a fresh task and keeps the
-previous saved chat available through `/resume`.
+session and in saved chats. The request now carries exact older requirements
+and excerpts relevant to your latest prompt, rather than simply losing the
+older window. In agent mode, the read-only `search_history` tool can search and
+recover exact previous messages and tool results, including after `/resume`.
+Recent tool evidence distinguishes completed actions from failed or skipped
+ones. `/remember <instruction>` keeps your most important constraints in each
+request; notes apply to this session and keep current tool permissions.
+`/clear` starts a fresh task and keeps the previous saved chat available through
+`/resume`.
+
+Long code blocks and large pasted drafts use a bounded live viewport. The full
+response prints when its block finishes; the full draft remains editable and
+is submitted unchanged. Completed output stays in terminal scrollback without
+being reformatted on every keypress. Saves append only new messages and tool
+results, avoiding a full-history rewrite after every reply. Existing saved
+chats migrate automatically on their next save.
 
 While a turn runs, an animated status stays visible through waiting, reasoning,
 writing, tool execution and permission prompts, including pauses after the first
@@ -95,7 +109,7 @@ unjailed -c     # continue the most recent chat in this folder
 unjailed -r     # choose a saved chat to resume
 ```
 
-Inside the app, `/resume` lists this folder's chats and `/sessions` lists all of them. Sessions are stored as JSON in `~/.unjailed/sessions/` (permissions `600`); the newest 200 are kept. To turn saving off, set `UNJAILED_NO_HISTORY=1` or put `"saveSessions": false` in `config.json`.
+Inside the app, `/resume` lists this folder's chats and `/sessions` lists all of them. Sessions use a small JSON manifest and an append-only JSONL history in `~/.unjailed/sessions/` (permissions `600`); the newest 200 are kept. To turn saving off, set `UNJAILED_NO_HISTORY=1` or put `"saveSessions": false` in `config.json`.
 
 ## Skills
 
@@ -211,7 +225,7 @@ The file holds `apiKey`, `model`, an optional `baseUrl`, `saveSessions`, and `fx
 
 ## Privacy
 
-The CLI sends no telemetry and no analytics, and makes no requests other than the API calls you trigger. Saved chats stay on your machine in `~/.unjailed/sessions/` and are never uploaded; delete them with `/sessions` → `d`, delete the folder, or turn saving off with `UNJAILED_NO_HISTORY=1`.
+The CLI sends no telemetry and no analytics, and makes no requests other than the API calls you trigger. Saved chat files stay on your machine in `~/.unjailed/sessions/`; request context and any history retrieved by the agent are sent to your configured API to answer your requests. Delete local histories with `/sessions` → `d`, delete the folder, or turn saving off with `UNJAILED_NO_HISTORY=1`.
 
 ## Development
 
@@ -229,15 +243,16 @@ The default API URL is set in `src/constants.ts` (`DEFAULT_BASE_URL`).
 
 ## Minor bugs and limitations
 
-- **Long-session delay / unclear activity (customer report, October 11, 2026):**
-  addressed with bounded request context, linear history trimming, memoized
-  transcript rendering and a continuous activity indicator. Model/server latency
-  still varies; `/context` shows context usage and `/clear` starts a fresh task.
-  Please report the CLI version, model, approximate session length and whether
-  the delay happens while typing, before the first token, or between tool calls.
-- Older context that is shortened or omitted can lose details; repeat important
-  project constraints when returning to much older work. Tool permissions and
-  action confirmations continue to apply in long and resumed sessions.
+- **Long-session rendering and memory (customer report, October 11, 2026):**
+  addressed with incremental stream parsing, bounded live response/draft
+  rendering, completed output outside Ink's growing static cache, async
+  append-only saves, older exact excerpts and recoverable tool history.
+  `/remember` pins critical instructions; `/context` shows request usage.
+- Model/server latency and model reasoning accuracy still vary. Context is
+  finite; automatic excerpts select relevant portions, and a model may need
+  to use `search_history` for an older detail. Very large completed responses
+  still take time proportional to the output they actually print. Saving
+  opt-out means history remains available only until you close the CLI.
 
 ## License
 

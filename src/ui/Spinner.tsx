@@ -41,7 +41,7 @@ export function Spinner({ label, kind = "idle", detail }: { label?: string; kind
   useEffect(() => {
     const t = setInterval(() => {
       setI((n) => n + 1);
-    }, 160);
+    }, 250);
     return () => clearInterval(t);
   }, []);
   const meta = META[kind];
@@ -54,7 +54,7 @@ export function Spinner({ label, kind = "idle", detail }: { label?: string; kind
   const verb = label ?? meta.verb;
   const tail = showTime ? `${timeStr} · Ctrl+C to stop` : `${timeStr}  · Ctrl+C to stop`;
   return (
-    <Text>
+    <Text wrap="truncate-end">
       {frameStr} {theme.bold(verb)}
       {detail ? theme.dim(` · ${detail.length > 48 ? detail.slice(0, 48) + "…" : detail}`) : ""}
       {theme.dim(` · ${tail}`)}

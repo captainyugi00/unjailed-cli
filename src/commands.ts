@@ -16,6 +16,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: "plan", description: "Plan mode: model drafts a numbered plan before touching anything", args: "[off]" },
   { name: "fun", description: "Toggle the fun effects (startup wink, side snow, sparkles)", args: "[on|off]" },
   { name: "api", description: "Show API endpoint, key and connection status" },
+  { name: "remember", description: "Pin an instruction in this session, or view/clear notes", args: "[text|clear]" },
   { name: "context", description: "Show token/context usage for this chat" },
   { name: "update", description: "Update the CLI to the latest npm version" },
   { name: "resume", description: "Continue a previous chat from this folder", args: "[n|id]" },

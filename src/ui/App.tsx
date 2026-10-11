@@ -1,5 +1,5 @@
-import React, { memo, useCallback, useEffect, useRef, useState } from "react";
-import { Box, Static, Text, useApp, useInput, useStdout, type Key } from "ink";
+import React, { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Box, renderToString, Text, useApp, useInput, useStdout, type Key } from "ink";
 import { AbortedError, ApiError, listModels, streamChatRetry, agentTurn, prepareRequestHistory, type AgentMessage, type ChatMessage } from "../api.js";
 import { COMMANDS, filterCommands, parseCommand } from "../commands.js";
 import { configPath, deleteKey, EFFORTS, maskKey, readConfig, resolveBaseUrl, resolveKey, writeConfig, type Effort, type KeySource } from "../config.js";
@@ -19,6 +19,7 @@ import { onFirstLine, onLastLine, Prompt, type EditorState } from "./Prompt.js";
 import { SelectList } from "./SelectList.js";
 import { Spinner, type WorkKind } from "./Spinner.js";
 import { useTerminalSize } from "./useTerminalSize.js";
+import { StreamDisplayBuffer, retainDisplayWindow, streamingRowBudget } from "./stream-buffer.js";
 import {
   deleteSession,
   findSession,
@@ -27,7 +28,7 @@ import {
   newSession,
   prettyPath,
   pruneSessions,
-  saveSession,
+  appendSession,
   sessionsDir,
   sessionsEnabled,
   timeAgo,
@@ -36,6 +37,8 @@ import {
   type SessionMeta,
 } from "../sessions.js";
 import stringWidth from "string-width";
+import { randomUUID } from "node:crypto";
+import { HISTORY_TOOL, identifyHistory, protectWorkingContext, searchHistory, workingContext, type ToolEvent } from "../context.js";
 
 type Item =
   | { id: number; kind: "header"; model: string; loggedIn: boolean; keySource: KeySource }
@@ -56,6 +59,7 @@ type Mode =
   | { type: "plan-approve"; steps: string[]; selected: number }; // 0 = start, 1 = cancel
 
 interface Stream {
+  hiddenCharacters: number;
   phase: "waiting" | "reasoning" | "writing";
   text: string; // not yet flushed to the transcript
   started: boolean; // any content received
@@ -74,30 +78,6 @@ const id = () => ++nextId;
 function friendly(err: unknown): string {
   if (err instanceof ApiError) return err.message;
   return "Something went wrong. Try again.";
-}
-
-/** Index just past the last blank line that is outside a code fence, or -1. */
-function safeFlushPoint(text: string): number {
-  let inFence = false;
-  let point = -1;
-  let offset = 0;
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length - 1; i++) {
-    const line = lines[i]!;
-    if (/^\s*(```|~~~)/.test(line)) inFence = !inFence;
-    offset += line.length + 1;
-    if (inFence) continue;
-    // blank line outside a fence = paragraph boundary (original rule)
-    if (line.trim() === "" && i > 0) { point = offset; continue; }
-    // completed table row = safe boundary too — tables stream row-by-row and
-    // have no blank lines inside them, so without this a mid-table reply sat
-    // unflushed in the live area until the whole response finished (and the
-    // live area is height-clipped → looked cut off)
-    if (line.trim().startsWith("|") && !/^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(line)) {
-      point = offset;
-    }
-  }
-  return point;
 }
 
 export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
@@ -137,6 +117,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const [fx, setFx] = useState<boolean>(() => fxEnabled());
 
   const messages = useRef<ChatMessage[]>([]);
+  const toolHistory = useRef<ToolEvent[]>([]);
+  const notes = useRef<string[]>([]);
+  const runningTurn = useRef(false);
+  const quitRequested = useRef(false);
   const session = useRef<Session | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const exitArmed = useRef(false);
@@ -148,7 +132,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const escArmed = useRef(false);
 
   const push = useCallback((...newItems: NewItem[]) => {
-    setItems((prev) => [...prev, ...newItems.map((it) => ({ ...it, id: id() }) as Item)]);
+    setItems((prev) => retainDisplayWindow([...prev, ...newItems.map((it) => ({ ...it, id: id() }) as Item)]));
   }, []);
   const info = (text: string) => push({ kind: "info", text });
   const success = (text: string) => push({ kind: "success", text });
@@ -172,7 +156,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     }, ms);
   };
 
-  // After a resize, wipe the screen and reprint the transcript at the new width. Ink alone
+  // After a resize, wipe the screen and reprint the recent display window. Ink alone
   // can't erase lines that the terminal re-wrapped, which leaves broken frames behind.
   const firstSize = useRef(true);
   useEffect(() => {
@@ -181,7 +165,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       return;
     }
     const t = setTimeout(() => {
-      stdout.write("\x1b[2J\x1b[3J\x1b[H");
+      // Preserve terminal scrollback; only repaint the visible recent window.
+      stdout.write("\x1b[2J\x1b[H");
       setItems((prev) => (prev[0]?.kind === "header" ? [{ ...prev[0], id: id(), model, loggedIn: !!auth.key, keySource: auth.source }, ...prev.slice(1)] : prev));
       setStaticKey((k) => k + 1);
     }, 120);
@@ -226,12 +211,21 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   }, [exiting, exit]);
   const quit = () => {
     abortRef.current?.abort();
-    setExiting(true);
+    quitRequested.current = true;
+    if (!runningTurn.current) setExiting(true);
   };
 
   // ---------- chat ----------
 
   const sendChat = async (text: string) => {
+    runningTurn.current = true;
+    try { await performChat(text); }
+    finally {
+      runningTurn.current = false;
+      if (quitRequested.current) setExiting(true);
+    }
+  };
+  const performChat = async (text: string) => {
     if (!auth.key) {
       push({ kind: "user", text });
       error(NOT_LOGGED_IN);
@@ -239,11 +233,12 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     }
     push({ kind: "user", text });
     messages.current.push({ role: "user", content: text });
+    const toolEventsBefore = toolHistory.current.length;
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     let full = "";
-    let pending = "";
+    const displayBuffer = new StreamDisplayBuffer();
     let reasoningChars = 0;
     let reasoningTail = "";
     let flushedAny = false;
@@ -257,22 +252,22 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const sync = () => {
       timer = undefined;
       // Move finished paragraphs into the transcript so the live area stays small.
-      const point = safeFlushPoint(pending);
-      if (point > 0) {
-        const done = pending.slice(0, point).replace(/\n+$/, "");
-        pending = pending.slice(point);
+      const completed = displayBuffer.drainSafe();
+      if (completed) {
+        const done = completed.replace(/\n+$/, "");
         if (done.trim()) {
           push({ kind: "assistant", text: done, first: !flushedAny });
           flushedAny = true;
         }
       }
-      setStream({ text: pending, started: full.length > 0, reasoning, flushed: flushedAny, reasoningChars, reasoningTail, phase });
+      const preview = displayBuffer.preview();
+      setStream({ text: preview.text, hiddenCharacters: preview.hiddenCharacters, started: full.length > 0, reasoning, flushed: flushedAny, reasoningChars, reasoningTail, phase });
     };
     const schedule = () => {
-      if (!timer) timer = setTimeout(sync, 40);
+      if (!timer) timer = setTimeout(sync, 80);
     };
 
-    setStream({ text: "", started: false, reasoning: false, flushed: false, reasoningChars: 0, reasoningTail: "", phase });
+    setStream({ text: "", hiddenCharacters: 0, started: false, reasoning: false, flushed: false, reasoningChars: 0, reasoningTail: "", phase });
     let outcome: "done" | "stopped" | "error" = "done";
     let errMsg = "";
     const useTools = toolsMode !== "off";
@@ -290,13 +285,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         onContextTrim: () => {
           if (trimNotified) return;
           trimNotified = true;
-          info("Older request context shortened or omitted for responsiveness; full chat text stays in this session and saved chats. Use /clear for a fresh task.");
+          info("Older request context compacted with exact excerpts; full history stays available. Pin key instructions with /remember. Agent tools can recover older text with search_history.");
         },
         onToken: (t: string) => {
           phase = "writing";
           reasoning = false;
           full += t;
-          pending += t;
+          displayBuffer.append(t);
           schedule();
         },
         onReasoning: (t: string) => {
@@ -346,7 +341,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         }
       } else {
         // agent loop: definitions + executor; run_command asks unless yolo/auto
-        const defs = toolDefinitions(toolsMode);
+        const defs = [...toolDefinitions(toolsMode), HISTORY_TOOL];
         const history: AgentMessage[] = [...baseMessages];
 
         // ── plan mode: mutating jobs get a numbered plan + explicit approval first ──
@@ -356,6 +351,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             if (full.trim()) messages.current.push({ role: "assistant", content: full });
             setStream(null);
             abortRef.current = null;
+            setBusy("Saving session");
+            await persist();
+            setBusy(null);
             return;
           }
         }
@@ -398,13 +396,19 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         }, ctrl.signal, {
           effort: autoEffortFor(text),
           tools: defs,
-          execute: (name, args) => executeTool(name, args, process.cwd(), async (command) => {
+          execute: async (name, args) => {
+            if (name === "search_history") return searchHistory(messages.current, toolHistory.current, args);
+            const result = await executeTool(name, args, process.cwd(), async (command) => {
             push({ kind: "plain", text: `${theme.warn("Allow this action?")}\n  ${command}\n${theme.dim("  y = run · n or Esc = skip")}` });
             setConfirmingCommand(command);
             const answer = await askYesNo();
             if (!answer) info("Skipped by user.");
             return answer;
-          }, { mode: toolsMode, autoApprove: yolo, signal: ctrl.signal }),
+            }, { mode: toolsMode, autoApprove: yolo, signal: ctrl.signal });
+            const event = { id: randomUUID(), name, args, ok: result.ok, output: result.output, at: Date.now() };
+            toolHistory.current.push(event);
+            return { ...result, historyEntry: `tool:${event.id}` };
+          },
         });
         // keep transcript consistent when the final text already streamed
         if (finalText && !full.trim()) { full = finalText; }
@@ -436,13 +440,16 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       abortRef.current = null;
     }
 
-    const rest = pending.replace(/\n+$/, "");
+    const rest = displayBuffer.finish().replace(/\n+$/, "");
     if (rest.trim()) push({ kind: "assistant", text: rest, first: !flushedAny });
     setStream(null);
+    setBusy("Saving session");
 
     if (full.trim()) messages.current.push({ role: "assistant", content: full });
-    else if (outcome !== "done") messages.current.pop(); // nothing came back; don't leave a dangling turn
-    persist();
+    else if (outcome !== "done" && toolHistory.current.length === toolEventsBefore) messages.current.pop();
+    // A tool may have changed a file before the model disconnected. Retain
+    // that task and its evidence even when no assistant prose arrived.
+    await persist();
 
     // Server didn't report usage — show a rough estimate (chars/4), clearly marked.
     if (!gotUsage) {
@@ -453,21 +460,22 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     if (outcome === "stopped") info("Stopped.");
     else if (outcome === "error") error(errMsg);
     else if (!full.trim()) info("(no response text — the model may have hit its output limit mid-reasoning; try /effort medium or rephrase)");
+    setBusy(null);
   };
 
   // ---------- sessions ----------
 
   /** Save the conversation so /resume can pick it up later. Never throws. */
-  const persist = () => {
-    if (!sessionsEnabled() || !messages.current.some((m) => m.role === "assistant")) return;
+  const persist = async () => {
+    if (!sessionsEnabled() || (!messages.current.some((m) => m.role === "assistant") && !toolHistory.current.length && !notes.current.length)) return;
     try {
       const s = session.current ?? newSession(process.cwd(), model);
       const first = !session.current;
-      session.current = { ...s, model, skills: activeSkills, title: s.title || titleFrom(messages.current), updated: Date.now(), messages: [...messages.current] };
-      saveSession(session.current);
+      session.current = { ...s, model, skills: activeSkills, title: s.title || titleFrom(messages.current), updated: Date.now(), messages: [...messages.current], toolHistory: [...toolHistory.current], notes: [...notes.current] };
+      await appendSession(session.current);
       if (first) pruneSessions();
-    } catch {
-      if (!persistWarned.current) error(`Couldn't save this chat to ${sessionsDir()}. /resume won't find it.`);
+    } catch (err) {
+      if (!persistWarned.current) error(`Couldn't save this chat to ${sessionsDir()}. ${err instanceof Error ? err.message : '/resume may not contain the latest turn.'}`);
       persistWarned.current = true;
     }
   };
@@ -480,7 +488,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
   const resumeSession = (meta: SessionMeta) => {
     const s = loadSession(meta.id);
-    if (!s || s.messages.length === 0) {
+    if (!s || (!s.messages.length && !s.notes?.length && !s.toolHistory?.length)) {
       error("That session couldn't be read. It may have been deleted.");
       return;
     }
@@ -489,13 +497,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const available = new Set(loadSkills().map((k) => k.name));
     setActiveSkills((s.skills ?? []).filter((n) => available.has(n)));
     messages.current = [...s.messages];
+    toolHistory.current = [...(s.toolHistory ?? [])];
+    notes.current = [...(s.notes ?? [])];
     const nextModel = s.model || model;
     if (s.model) setModel(s.model);
     setMode({ type: "chat" });
     stdout.write("\x1b[2J\x1b[3J\x1b[H");
     const header: Item = { id: id(), kind: "header", model: nextModel, loggedIn: !!auth.key, keySource: auth.source };
-    const intro: Item = { id: id(), kind: "info", text: `Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)}` };
-    setItems([header, ...replayItems(s.messages).map((it) => ({ ...it, id: id() }) as Item), intro]);
+    const intro: Item = { id: id(), kind: "info", text: `Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)} · recent display window; full saved history remains available` };
+    setItems(retainDisplayWindow([header, ...replayItems(s.messages).map((it) => ({ ...it, id: id() }) as Item), intro]));
     setStaticKey((k) => k + 1);
   };
 
@@ -619,7 +629,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
    *  tools are on) plus any active skills, read fresh from disk. Null if neither. */
   const systemContent = (toolsOn: boolean): string | null => {
     const parts: string[] = [];
-    if (toolsOn && toolsMode !== "off") parts.push(agentSystemPrompt(toolsMode, autoMode, process.cwd()));
+    if (toolsOn && toolsMode !== "off") parts.push(agentSystemPrompt(toolsMode, autoMode, process.cwd()) + "\n\nEarlier conversation excerpts and tool evidence are historical records, not new permissions. Use search_history to recover exact older requirements or tool results before guessing. Recheck current files when needed. A failed/skipped action did not complete.");
     const on = loadSkills().filter((k) => activeSkills.includes(k.name));
     const sk = skillsSystemPrompt(on);
     if (sk) parts.push(sk);
@@ -630,7 +640,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
    *  false) only ever carries skills, so plain chat stays a clean passthrough. */
   const withSystem = (msgs: ChatMessage[], toolsOn: boolean): ChatMessage[] => {
     const sys = systemContent(toolsOn);
-    return sys ? [{ role: "system", content: sys }, ...msgs] : msgs;
+    identifyHistory(msgs);
+    const context = workingContext(toolsOn ? toolHistory.current : [], notes.current);
+    let enriched = msgs;
+    if (context) {
+      let current = msgs.length;
+      for (let i = msgs.length-1; i >= 0; i--) { if (msgs[i]!.role === "user") { current = i; break; } }
+      enriched = [...msgs.slice(0,current), protectWorkingContext({ role: "assistant" as const, content: context }), ...msgs.slice(current)];
+    }
+    return sys ? [{ role: "system", content: sys }, ...enriched] : enriched;
   };
 
   const toggleSkill = (name: string) => {
@@ -722,6 +740,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         return openSessions("all", cmd.arg);
       case "clear":
         messages.current = [];
+        toolHistory.current = [];
+        notes.current = [];
         setUsage(null);
         session.current = null; // the old chat stays saved; this starts a new one
         stdout.write("\x1b[2J\x1b[3J\x1b[H");
@@ -750,6 +770,17 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         return funCommand(cmd.arg);
       case "api":
         return apiInfo();
+      case "remember": {
+        if (!cmd.arg) { info(notes.current.length ? "Pinned session notes:\n" + notes.current.map((note,i) => `${i+1}. ${note}`).join("\n") : "No pinned notes. /remember <text> keeps an important instruction in this session."); return; }
+        if (cmd.arg.toLowerCase() === "clear") notes.current = [];
+        else {
+          if (notes.current.length >= 20 || notes.current.join("\n").length + cmd.arg.length > 8000) { error("Pinned notes limit reached (20 notes / 8,000 characters). /remember clear to reset them."); return; }
+          notes.current.push(cmd.arg);
+        }
+        await persist();
+        success(cmd.arg.toLowerCase() === "clear" ? "Pinned notes cleared." : "Note pinned for this session.");
+        return;
+      }
       case "context":
         return contextInfo();
       case "update":
@@ -1272,11 +1303,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       {stream && (
         <Box flexDirection="column" marginBottom={1}>
           {stream.text.trim() ? (
-            <AssistantText text={stream.text} first={!stream.flushed} maxLines={Math.max(4, size.rows - 10)} width={width} />
+            <AssistantText text={stream.text} first={!stream.flushed} maxLines={streamingRowBudget(size.rows, width, editor.value, stream.phase === "reasoning", mode.type === "plan-approve")} width={width} hiddenCharacters={stream.hiddenCharacters} />
           ) : null}
           {!liveTool.current && <Spinner kind={stream.phase === "writing" ? "streaming" : stream.phase === "reasoning" ? "reasoning" : "idle"} label={confirmingCommand ? "Waiting for permission" : mode.type === "plan-approve" ? "Waiting for plan approval" : stream.phase === "waiting" ? "Waiting for response" : undefined} />}
           {stream.phase === "reasoning" && !liveTool.current && (
-            <Text>{theme.dim(`  thinking… ${stream.reasoningChars.toLocaleString()} chars · ${stream.reasoningTail.slice(-70).replace(/\s+/g, " ").trim()}`)}</Text>
+            <Text wrap="truncate-end">{theme.dim(`  thinking… ${stream.reasoningChars.toLocaleString()} chars · ${stream.reasoningTail.slice(-70).replace(/\s+/g, " ").trim()}`)}</Text>
           )}
           {liveTool.current && (
             <Spinner kind={toolWorkKind(liveTool.current.name)} label={confirmingCommand ? "Waiting for permission" : undefined} detail={liveTool.current.detail} />
@@ -1374,6 +1405,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         <Box flexDirection="column">
           <Text>{theme.dim("─".repeat(Math.max(10, width - 1)))}</Text>
           <Prompt
+            width={width}
+            maxRows={Math.max(1, Math.min(4, Math.floor(size.rows / 4)))}
             state={editor}
             onChange={(s) => {
               setEditor(s);
@@ -1468,20 +1501,23 @@ function tailToFit(rendered: string, maxLines: number, width: number): { text: s
   return { text: lines.slice(start).join("\n"), hidden: start };
 }
 
-const AssistantText = memo(function AssistantText({ text, first, maxLines, width }: { text: string; first: boolean; maxLines?: number; width?: number }) {
-  let body = renderMarkdown(text, { width });
+const AssistantText = memo(function AssistantText({ text, first, maxLines, width, hiddenCharacters = 0 }: { text: string; first: boolean; maxLines?: number; width?: number; hiddenCharacters?: number }) {
+  let body = renderMarkdown(text, { width, highlightCode: !maxLines });
   let hidden = 0;
   // While streaming, the live area must stay shorter than the terminal or Ink redraws the whole
   // screen on every token. Older lines show in full once the paragraph or reply finishes.
-  if (maxLines && width) ({ text: body, hidden } = tailToFit(body, maxLines, width));
+  if (maxLines && width) {
+    ({ text: body, hidden } = tailToFit(body, maxLines, width));
+    if (hidden || hiddenCharacters) ({ text: body, hidden } = tailToFit(body || "", Math.max(0, maxLines - 1), width));
+  }
   return (
     <Box flexDirection="row">
       <Box width={2} flexShrink={0}>
         <Text>{first ? theme.brand("●") : " "}</Text>
       </Box>
       <Box flexGrow={1} flexDirection="column">
-        {hidden > 0 && <Text>{theme.dim(`⋯ ${hidden} more line${hidden === 1 ? "" : "s"} above (shown in full when done)`)}</Text>}
-        <Text>{body}</Text>
+        {(hidden > 0 || hiddenCharacters > 0) && <Text wrap="truncate-end">{theme.dim("⋯ earlier text appears in full when this block finishes")}</Text>}
+        {body ? <Text>{body}</Text> : null}
       </Box>
     </Box>
   );
@@ -1489,8 +1525,43 @@ const AssistantText = memo(function AssistantText({ text, first, maxLines, width
 
 // Static output is already in terminal scrollback. Typing and streaming must
 // not revisit every old message or re-render its markdown on each live update.
-const Transcript = memo(function Transcript({ items, width }: { items: Item[]; width: number }) {
-  return <Static items={items}>{(item) => <TranscriptItem key={item.id} item={item} width={width} />}</Static>;
+export const Transcript = memo(function Transcript({ items, width }: { items: Item[]; width: number }) {
+  const { write, stdout } = useStdout();
+  const printedThrough = useRef(0);
+  const queued = useRef<Item[]>([]);
+  const timer = useRef<NodeJS.Immediate | undefined>(undefined);
+  const columns = useRef(width);
+  columns.current = width;
+  useLayoutEffect(() => {
+    const pending = items.filter((item) => item.id > printedThrough.current);
+    if (!pending.length) return;
+    printedThrough.current = items.reduce((latest, item) => Math.max(latest, item.id), printedThrough.current);
+    queued.current.push(...pending);
+    if (timer.current) return;
+    // renderToString creates/frees a temporary Yoga tree. Run it outside the
+    // React commit, then public stdout.write prints above the live UI. Unlike
+    // Static, this does not accumulate Ink's fullStaticOutput transcript cache.
+    timer.current = setImmediate(() => {
+      timer.current = undefined;
+      const batch = queued.current;
+      queued.current = [];
+      const output = renderToString(<Box flexDirection="column">{batch.map((item) => <TranscriptItem key={item.id} item={item} width={columns.current} />)}</Box>, { columns: columns.current });
+      write(output + "\n");
+    });
+  }, [items, write]);
+  useEffect(() => () => {
+    if (timer.current) clearImmediate(timer.current);
+    // Ink disables its managed write function before unmount effects run.
+    // Flush any not-yet-rendered text directly while stdout is still open;
+    // shutdown output is plain markdown, and cannot disappear on immediate exit.
+    const remaining = queued.current;
+    queued.current = [];
+    if (remaining.length && !stdout.destroyed && !stdout.writableEnded) {
+      const text = remaining.map((item) => item.kind === "header" ? "Unjailed AI" : item.text).join("\n\n");
+      stdout.write(text + "\n");
+    }
+  }, []);
+  return null;
 });
 
 function TranscriptItem({ item, width }: { item: Item; width: number }) {

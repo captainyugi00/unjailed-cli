@@ -1,0 +1,29 @@
+{
+  "fakeLocalDataOnly": true,
+  "customerMutations": 0,
+  "colorEnabled": "3",
+  "cases": {
+    "openCodeFence": {
+      "sourceChars": 55594,
+      "frames": 60,
+      "previousMs": 460.23,
+      "currentMs": 4.81,
+      "speedup": 95.76,
+      "previousParsedChars": 1695646,
+      "currentRenderedChars": 141879,
+      "maximumLivePreviewChars": 2400,
+      "incrementallyScannedChars": 55594
+    },
+    "proseWithoutBlankLines": {
+      "sourceChars": 65700,
+      "frames": 60,
+      "previousMs": 122.19,
+      "currentMs": 7.8,
+      "speedup": 15.66,
+      "previousParsedChars": 2003850,
+      "currentRenderedChars": 142485,
+      "maximumLivePreviewChars": 2400,
+      "incrementallyScannedChars": 0
+    }
+  }
+}

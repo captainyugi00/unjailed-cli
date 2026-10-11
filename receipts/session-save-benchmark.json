@@ -1,0 +1,18 @@
+{
+  "fakeLocalDataOnly": true,
+  "customerMutations": 0,
+  "historyMessages": 4000,
+  "newTurns": 20,
+  "savedMessages": 4040,
+  "fullHistoryPreserved": true,
+  "previous": {
+    "totalRewriteMs": 155.61,
+    "writtenBytes": 118838980
+  },
+  "current": {
+    "totalAppendMs": 9.27,
+    "newJournalBytes": 2820,
+    "metadataBytes": 4920,
+    "writtenBytes": 7740
+  }
+}
