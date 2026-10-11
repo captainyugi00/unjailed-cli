@@ -1,0 +1,31 @@
+{
+  "version": "0.12.2",
+  "implementationCommit": "450d1c2",
+  "releaseCommit": "99f840e",
+  "gitHub": "https://github.com/unjailedai/unjailedCLI",
+  "gitHubPublic": true,
+  "npmPublic": true,
+  "latestTag": "0.12.2",
+  "cleanInstallVersion": "0.12.2",
+  "installedCompiledFilesMatchLocal": 27,
+  "typeScript": "passed",
+  "tests": {
+    "passed": 76,
+    "failed": 0
+  },
+  "packageAudit": {
+    "files": 31,
+    "allowedOnly": true,
+    "noCredentialsOrCustomerData": true
+  },
+  "terminalReceipts": [
+    "long-session-behavior.json",
+    "rendering-pty.json"
+  ],
+  "benchmarks": [
+    "rendering-benchmark.json",
+    "session-save-benchmark.json"
+  ],
+  "physicalWindowsTest": false,
+  "customerMutations": 0
+}

@@ -1,10 +1,10 @@
 {
-  "version": "0.12.1",
+  "version": "0.12.2",
   "savedMessagesBefore": 360,
   "savedMessagesAfter": 362,
   "request": {
-    "messages": 160,
-    "contentChars": 95183,
+    "messages": 161,
+    "contentChars": 89494,
     "lastUser": "slowstatus"
   },
   "waitingActivityVisible": true,
