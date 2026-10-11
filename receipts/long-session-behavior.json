@@ -1,0 +1,14 @@
+{
+  "savedMessagesBefore": 360,
+  "savedMessagesAfter": 362,
+  "request": {
+    "messages": 160,
+    "contentChars": 95183,
+    "lastUser": "slowstatus"
+  },
+  "waitingActivityVisible": true,
+  "activityAfterFirstTokenVisible": true,
+  "savedHistoryPreserved": true,
+  "fakeLocalApiOnly": true,
+  "customerMutations": 0
+}

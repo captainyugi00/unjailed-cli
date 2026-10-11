@@ -140,6 +140,10 @@ export interface Usage {
 
 export interface StreamHandlers {
   onToken: (text: string) => void;
+  /** Each network attempt, including retries and subsequent agent rounds. */
+  onRequest?: (context: { characters: number; messages: number }) => void;
+  /** Old content was shortened in the request copy; local history is unchanged. */
+  onContextTrim?: () => void;
   onReasoning?: (text: string) => void;
   /** Fired once per request when the server reports token usage. */
   onUsage?: (usage: Usage) => void;
@@ -210,13 +214,16 @@ export async function streamChat(
   signal: AbortSignal,
   options: { effort?: string; tools?: unknown[]; toolChoice?: unknown } = {},
 ): Promise<AgentStreamResult | undefined> {
+  const prepared = prepareRequestHistory(messages as AgentMessage[]);
+  handlers.onRequest?.({ characters: prepared.messages.reduce((n, m) => n + msgSize(m), 0), messages: prepared.messages.length });
+  if (prepared.trimmed) handlers.onContextTrim?.();
   const { res, controller } = await request(baseUrl, "/chat/completions", {
     method: "POST",
     key,
     signal,
     body: JSON.stringify({
       model,
-      messages,
+      messages: prepared.messages,
       stream: true,
       stream_options: { include_usage: true },
       ...(options.tools && options.tools.length ? { tools: options.tools } : {}),
@@ -382,7 +389,6 @@ export async function agentTurn(
   for (let round = 0; round < maxRounds; round++) {
     exhausted = round === maxRounds - 1;
     if (signal.aborted) throw new AbortedError();
-    trimHistory(history);
     let roundText = "";
     const res = await streamChatRetry(baseUrl, key, model, history as ChatMessage[], {
       ...handlers,
@@ -431,13 +437,45 @@ export async function agentTurn(
 
 /** Keep the request payload lean and inside upstream limits:
  *  - no single message over 28k chars (upstream rejects >32k strings)
- *  - whole history under ~260k chars (~65k tokens) by SHRINKING old content,
+ *  - target history under ~96k chars (~24k tokens) by SHRINKING old content,
  *    never deleting messages — so every assistant tool_calls message keeps its
  *    paired tool result (dropping one would orphan the other and some servers
  *    400 on that). The system message (index 0) and the most recent turns are
  *    left intact; only old context is compressed. */
 const MAX_MSG_CHARS = 28_000;
-const MAX_HISTORY_CHARS = 260_000;
+const MAX_HISTORY_CHARS = 96_000;
+const MAX_REQUEST_MESSAGES = 160;
+
+/** Prepare only the wire copy. Completed chats and resumable sessions retain
+ * their full text. Old saved chats may contain tool calls whose results were
+ * never saved: drop those calls rather than send orphaned protocol entries. */
+export function prepareRequestHistory(history: AgentMessage[]): { messages: AgentMessage[]; trimmed: boolean } {
+  // Tiny messages can evade a character budget. Retain the initial task and
+  // recent complete user turns, never cutting inside a live tool-call group.
+  let selected = history;
+  if (history.length > MAX_REQUEST_MESSAGES) {
+    const target = history.length - MAX_REQUEST_MESSAGES;
+    let cut = history.findIndex((m, i) => i >= target && m.role === "user");
+    if (cut < 0) {
+      // A single active tool-heavy turn can exceed the target; retain it whole.
+      for (let i = target - 1; i >= 0; i--) {
+        if (history[i]!.role === "user") { cut = i; break; }
+      }
+    }
+    if (cut > 0) {
+      const firstUser = history.findIndex((m) => m.role === "user");
+      selected = history.filter((m, i) => i >= cut || m.role === "system" || i === firstUser);
+    }
+  }
+  const resultIds = new Set(selected.filter((m) => m.role === "tool").map((m) => m.tool_call_id));
+  const messages: AgentMessage[] = selected.map((m) => {
+    if (m.role !== "assistant" || !m.tool_calls) return { ...m };
+    const calls = m.tool_calls.filter((call) => resultIds.has(call.id));
+    return calls.length ? { ...m, tool_calls: calls } : { role: "assistant", content: m.content };
+  });
+  trimHistory(messages);
+  return { messages, trimmed: selected.length !== history.length || messages.some((m, i) => m.content !== selected[i]!.content) };
+}
 
 /** Approx wire size of a message (content + any tool_calls payload). */
 function msgSize(m: AgentMessage): number {
@@ -453,28 +491,34 @@ export function trimHistory(history: AgentMessage[]): void {
       (m as { content: string }).content = m.content.slice(0, MAX_MSG_CHARS - 30) + "\n…(trimmed)";
     }
   }
-  const total = () => history.reduce((n, m) => n + msgSize(m), 0);
-  if (total() <= MAX_HISTORY_CHARS) return;
+  // Account once, then subtract each reduction. Repeated full-history scans
+  // here made trimming quadratic in long coding conversations.
+  let total = history.reduce((n, m) => n + msgSize(m), 0);
+  if (total <= MAX_HISTORY_CHARS) return;
+  const shorten = (m: AgentMessage, content: string) => {
+    total -= m.content.length - content.length;
+    m.content = content;
+  };
 
   // 2) stub OLD tool-result bodies first — they dominate the payload. Keep the
   //    message itself (pairing stays valid), just drop the bulky body. The
   //    newest two tool results are left whole; the model usually needs them.
   const toolIdx = history.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
   for (const i of toolIdx.slice(0, Math.max(0, toolIdx.length - 2))) {
-    if (total() <= MAX_HISTORY_CHARS) break;
+    if (total <= MAX_HISTORY_CHARS) break;
     const m = history[i]!;
     if (typeof m.content === "string" && m.content.length > 100) {
-      (m as { content: string }).content = m.content.slice(0, 80) + " …[old tool result trimmed]";
+      shorten(m, m.content.slice(0, 80) + " …[old tool result trimmed]");
     }
   }
 
   // 3) still over budget? compress old assistant/user prose (oldest first),
   //    always keeping the system message (0) and the last 4 messages untouched.
-  for (let i = 1; i < history.length - 4 && total() > MAX_HISTORY_CHARS; i++) {
+  for (let i = 1; i < history.length - 4 && total > MAX_HISTORY_CHARS; i++) {
     const m = history[i]!;
     if (m.role === "tool") continue; // already handled above
     if (typeof m.content === "string" && m.content.length > 600) {
-      (m as { content: string }).content = m.content.slice(0, 300) + "\n…[earlier context trimmed]\n" + m.content.slice(-200);
+      shorten(m, m.content.slice(0, 300) + "\n…[earlier context trimmed]\n" + m.content.slice(-200));
     }
   }
 }

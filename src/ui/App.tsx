@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import { Box, Static, Text, useApp, useInput, useStdout, type Key } from "ink";
-import { AbortedError, ApiError, listModels, streamChatRetry, agentTurn, type AgentMessage, type ChatMessage } from "../api.js";
+import { AbortedError, ApiError, listModels, streamChatRetry, agentTurn, prepareRequestHistory, type AgentMessage, type ChatMessage } from "../api.js";
 import { COMMANDS, filterCommands, parseCommand } from "../commands.js";
 import { configPath, deleteKey, EFFORTS, maskKey, readConfig, resolveBaseUrl, resolveKey, writeConfig, type Effort, type KeySource } from "../config.js";
 import { executeTool, toolDefinitions } from "../tools.js";
@@ -56,6 +56,7 @@ type Mode =
   | { type: "plan-approve"; steps: string[]; selected: number }; // 0 = start, 1 = cancel
 
 interface Stream {
+  phase: "waiting" | "reasoning" | "writing";
   text: string; // not yet flushed to the transcript
   started: boolean; // any content received
   reasoning: boolean;
@@ -248,6 +249,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     let flushedAny = false;
     let reasoning = false;
     let gotUsage = false;
+    let requestContextChars = 0;
+    let phase: Stream["phase"] = "waiting";
+    let trimNotified = false;
     let timer: NodeJS.Timeout | undefined;
 
     const sync = () => {
@@ -262,13 +266,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           flushedAny = true;
         }
       }
-      setStream({ text: pending, started: full.length > 0, reasoning, flushed: flushedAny, reasoningChars, reasoningTail });
+      setStream({ text: pending, started: full.length > 0, reasoning, flushed: flushedAny, reasoningChars, reasoningTail, phase });
     };
     const schedule = () => {
       if (!timer) timer = setTimeout(sync, 40);
     };
 
-    setStream({ text: "", started: false, reasoning: false, flushed: false, reasoningChars: 0, reasoningTail: "" });
+    setStream({ text: "", started: false, reasoning: false, flushed: false, reasoningChars: 0, reasoningTail: "", phase });
     let outcome: "done" | "stopped" | "error" = "done";
     let errMsg = "";
     const useTools = toolsMode !== "off";
@@ -277,12 +281,26 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     try {
       const baseMessages = withSystem(messages.current, useTools);
       const streamHandlers = {
+        onRequest: (context: { characters: number; messages: number }) => {
+          requestContextChars = context.characters;
+          phase = "waiting";
+          reasoning = false;
+          schedule();
+        },
+        onContextTrim: () => {
+          if (trimNotified) return;
+          trimNotified = true;
+          info("Older request context shortened or omitted for responsiveness; full chat text stays in this session and saved chats. Use /clear for a fresh task.");
+        },
         onToken: (t: string) => {
+          phase = "writing";
+          reasoning = false;
           full += t;
           pending += t;
           schedule();
         },
         onReasoning: (t: string) => {
+          phase = "reasoning";
           if (!reasoning) { reasoning = true; schedule(); }
           reasoningChars += t ? t.length : 0;
           if (t) reasoningTail = (reasoningTail + t).slice(-90);
@@ -390,8 +408,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         });
         // keep transcript consistent when the final text already streamed
         if (finalText && !full.trim()) { full = finalText; }
-        // agent history (with tool messages) becomes the conversation
-        messages.current = history.filter((m) => m.role !== "system" && m.role !== "tool") as ChatMessage[];
+        // Keep the original user/assistant transcript, not the shortened agent
+        // scratch history. Dropping only tool results used to retain orphaned
+        // tool_calls and duplicate intermediate prose in the next turn.
       }
     } catch (err) {
       if (err instanceof AbortedError) outcome = "stopped";
@@ -413,6 +432,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       }
     } finally {
       clearTimeout(timer);
+      liveTool.current = null;
       abortRef.current = null;
     }
 
@@ -426,8 +446,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
     // Server didn't report usage — show a rough estimate (chars/4), clearly marked.
     if (!gotUsage) {
-      const chars = messages.current.reduce((n, m) => n + m.content.length, 0);
-      const est = Math.round(chars / 4);
+      const est = Math.round(requestContextChars / 4);
       setUsage({ ctx: est, prompt: est, completion: Math.round(full.length / 4), approx: true });
     }
 
@@ -769,7 +788,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const contextInfo = () => {
     const count = messages.current.length;
     if (!usage) {
-      const chars = messages.current.reduce((n, m) => n + m.content.length, 0);
+      const chars = prepareRequestHistory(withSystem(messages.current, toolsMode !== "off")).messages.reduce((n, m) => n + m.content.length, 0);
       push({ kind: "plain", text: [
         `${theme.dim("Context  ")} ~${fmtTokens(Math.round(chars / 4))} tokens ${theme.dim("(estimated — send a message to get real counts)")}`,
         `${theme.dim("Messages ")} ${count}`,
@@ -1240,17 +1259,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
   if (exiting) {
     return (
-      <Static key={staticKey} items={items}>
-        {(item) => <TranscriptItem key={item.id} item={item} width={width} />}
-      </Static>
+      <Transcript key={staticKey} items={items} width={width} />
     );
   }
 
   return (
     <>
-      <Static key={staticKey} items={items}>
-        {(item) => <TranscriptItem key={item.id} item={item} width={width} />}
-      </Static>
+      <Transcript key={staticKey} items={items} width={width} />
 
       {fx && <FinishFlourish streaming={!!stream} />}
 
@@ -1259,14 +1274,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           {stream.text.trim() ? (
             <AssistantText text={stream.text} first={!stream.flushed} maxLines={Math.max(4, size.rows - 10)} width={width} />
           ) : null}
-          {!stream.started && !liveTool.current && <Spinner kind={stream.reasoning ? "reasoning" : "idle"} />}
-          {stream.reasoning && !stream.started && !liveTool.current && (
+          {!liveTool.current && <Spinner kind={stream.phase === "writing" ? "streaming" : stream.phase === "reasoning" ? "reasoning" : "idle"} label={confirmingCommand ? "Waiting for permission" : mode.type === "plan-approve" ? "Waiting for plan approval" : stream.phase === "waiting" ? "Waiting for response" : undefined} />}
+          {stream.phase === "reasoning" && !liveTool.current && (
             <Text>{theme.dim(`  thinking… ${stream.reasoningChars.toLocaleString()} chars · ${stream.reasoningTail.slice(-70).replace(/\s+/g, " ").trim()}`)}</Text>
           )}
           {liveTool.current && (
-            <Spinner kind={toolWorkKind(liveTool.current.name)} detail={liveTool.current.detail} />
+            <Spinner kind={toolWorkKind(liveTool.current.name)} label={confirmingCommand ? "Waiting for permission" : undefined} detail={liveTool.current.detail} />
           )}
-          {stream.started && !stream.text.trim() && !liveTool.current && <Text>{theme.dim("  …")}</Text>}
         </Box>
       )}
 
@@ -1454,7 +1468,7 @@ function tailToFit(rendered: string, maxLines: number, width: number): { text: s
   return { text: lines.slice(start).join("\n"), hidden: start };
 }
 
-function AssistantText({ text, first, maxLines, width }: { text: string; first: boolean; maxLines?: number; width?: number }) {
+const AssistantText = memo(function AssistantText({ text, first, maxLines, width }: { text: string; first: boolean; maxLines?: number; width?: number }) {
   let body = renderMarkdown(text, { width });
   let hidden = 0;
   // While streaming, the live area must stay shorter than the terminal or Ink redraws the whole
@@ -1471,7 +1485,13 @@ function AssistantText({ text, first, maxLines, width }: { text: string; first: 
       </Box>
     </Box>
   );
-}
+});
+
+// Static output is already in terminal scrollback. Typing and streaming must
+// not revisit every old message or re-render its markdown on each live update.
+const Transcript = memo(function Transcript({ items, width }: { items: Item[]; width: number }) {
+  return <Static items={items}>{(item) => <TranscriptItem key={item.id} item={item} width={width} />}</Static>;
+});
 
 function TranscriptItem({ item, width }: { item: Item; width: number }) {
   switch (item.kind) {

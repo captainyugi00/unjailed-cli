@@ -38,19 +38,17 @@ const META: Record<WorkKind, { frames: string[]; verb: string }> = {
 export function Spinner({ label, kind = "idle", detail }: { label?: string; kind?: WorkKind; detail?: string }) {
   const [i, setI] = useState(0);
   const [start] = useState(() => Date.now());
-  const [tick, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => {
       setI((n) => n + 1);
-      setTick((n) => n + 1);
-    }, 110);
+    }, 160);
     return () => clearInterval(t);
   }, []);
   const meta = META[kind];
   const secs = Math.floor((Date.now() - start) / 1000);
   const timeStr = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, "0")}` : `${secs}s`;
   // blink the elapsed counter every ~half second so the line feels alive even between frames
-  const showTime = tick % 10 !== 9 || secs === 0;
+  const showTime = i % 10 !== 9 || secs === 0;
   const frame = meta.frames[i % meta.frames.length]!;
   const frameStr = theme.brand(frame);
   const verb = label ?? meta.verb;

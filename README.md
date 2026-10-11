@@ -75,6 +75,21 @@ npm install -g unjailed@latest
 
 Chats are saved automatically after each reply, tagged with the folder you started `unjailed` in, so each project keeps its own history.
 
+Long chats automatically shorten older **request context** to keep the terminal
+and requests responsive. Requests target about 96,000 characters and 160 recent
+messages; the initial task, system instructions, recent turns and complete live
+tool-call/result groups are retained. These are targets: a large active tool
+group or protected recent turn can exceed them. The CLI tells you when older
+request text was shortened or omitted. Your full chat text stays in the current
+session and in saved chats; this is not a model-generated summary, so older
+details may need to be repeated. `/clear` starts a fresh task and keeps the
+previous saved chat available through `/resume`.
+
+While a turn runs, an animated status stays visible through waiting, reasoning,
+writing, tool execution and permission prompts, including pauses after the first
+response text. It shows elapsed time and the stop shortcut. Waiting indicates an
+open request, not a guarantee that the server is making progress.
+
 ```sh
 unjailed -c     # continue the most recent chat in this folder
 unjailed -r     # choose a saved chat to resume
@@ -211,6 +226,18 @@ npm test          # unit + integration tests against the mock
 Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior.
 
 The default API URL is set in `src/constants.ts` (`DEFAULT_BASE_URL`).
+
+## Minor bugs and limitations
+
+- **Long-session delay / unclear activity (customer report, October 11, 2026):**
+  addressed with bounded request context, linear history trimming, memoized
+  transcript rendering and a continuous activity indicator. Model/server latency
+  still varies; `/context` shows context usage and `/clear` starts a fresh task.
+  Please report the CLI version, model, approximate session length and whether
+  the delay happens while typing, before the first token, or between tool calls.
+- Older context that is shortened or omitted can lose details; repeat important
+  project constraints when returning to much older work. Tool permissions and
+  action confirmations continue to apply in long and resumed sessions.
 
 ## License
 
