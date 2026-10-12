@@ -1243,8 +1243,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   );
 
   useInput((input, key) => {
-    if (mode.type !== "tool-permissions" || key.ctrl || key.meta) return;
+    if (mode.type !== "tool-permissions") return;
     if (key.escape) { setMode({ type: "chat" }); return; }
+    if (key.ctrl || key.meta) return;
     if (Date.now() - toolArmedAt.current < 150) return;
     if (key.upArrow) setMode({ ...mode, selected: (mode.selected - 1 + TOOL_CHOICES.length) % TOOL_CHOICES.length });
     else if (key.downArrow || key.tab) setMode({ ...mode, selected: (mode.selected + 1) % TOOL_CHOICES.length });

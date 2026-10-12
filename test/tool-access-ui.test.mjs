@@ -18,7 +18,7 @@ test.after(()=>{cleanup();fs.rmSync(home,{recursive:true,force:true});});
 test('auto from read/off opens a permission picker, cancellation retains restricted access and does not persist auto approval',async()=>{
  for(const tools of ['read','off']){
   reset({tools});const ui=render(React.createElement(App));
-  try{await sleep(200);await submit(ui,'/auto');assert.ok(ui.frames.some(frame=>/Choose tool permissions/.test(frame)));assert.ok(ui.frames.some(frame=>/Select the access you authorize/.test(frame)));assert.equal(readConfig().tools,tools);assert.equal(readConfig().autoMode,'ask');ui.stdin.write('\u001b');await sleep(200);assert.equal(readConfig().tools,tools);assert.equal(readConfig().autoMode,'ask');}
+  try{await sleep(200);await submit(ui,'/auto');assert.ok(ui.frames.some(frame=>/Choose tool permissions/.test(frame)));assert.ok(ui.frames.some(frame=>/Select the access you authorize/.test(frame)));assert.equal(readConfig().tools,tools);assert.equal(readConfig().autoMode,'ask');ui.stdin.write('\u001b');await sleep(200);assert.equal(readConfig().tools,tools);assert.equal(readConfig().autoMode,'ask');await submit(ui,'/tools cmds');assert.equal(readConfig().tools,'cmds');assert.equal(readConfig().autoMode,'ask');}
   finally{ui.unmount();ui.cleanup();}
  }
 });
