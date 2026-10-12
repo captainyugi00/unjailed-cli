@@ -12,11 +12,13 @@ import { configDir } from "./config.js";
  *   return found;
  *
  * Globals: agent(prompt, {label, phase, schema}), parallel(thunks),
- * pipeline(items, ...stages), phase(title), log(message), args.
+ * pipeline(items, ...stages), phase(title), log(message), console, args.
+ * At most 16 agents per run, 4 at a time.
  *
- * The script runs in a separate V8 context so a typo can't clobber the CLI's
- * globals. That is not a security boundary: a script can do anything a
- * command could, so running one needs the same permission as run_command.
+ * The script runs in a worker thread, inside a fresh V8 context, so a typo can't
+ * clobber the CLI's globals and a runaway script can be terminated. That is not a
+ * security boundary: a script can do anything a command could, so running one
+ * needs the same permission as run_command.
  */
 export interface WorkflowMeta {
   name: string;

@@ -3,9 +3,11 @@ import type { ToolDef } from "./tools.js";
 /**
  * /loop — run a prompt (or slash command) again and again.
  *
- *   /loop 5m check the deploy      fixed interval (compact: 30s, 5m, 2h, 1h30m), from the end of each run
+ *   /loop 5m check the deploy      fixed interval (compact: 30s, 5m, 2h, 1h30m; 10s to 7d), from the end of each run
  *   /loop check the deploy every 2h
- *   /loop babysit the PR           self-paced: the agent picks each delay with schedule_next
+ *   /loop babysit the PR           self-paced: the agent picks each delay (60s-1h) with schedule_next; default 10m
+ *   /loop                          show status
+ *   /loop resume                   continue a loop paused by stopping a run
  *   /loop stop                     cancel
  */
 export interface LoopSpec {

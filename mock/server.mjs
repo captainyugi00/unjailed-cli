@@ -12,9 +12,15 @@
 //   "reason"     → streams reasoning_content before the answer
 //   "markdown"   → a long markdown sample with code blocks
 //   "longcode"   → an 80-line code block (tests the live-area height cap)
-//   "debug"      → reports the reasoning_effort and system prompt it received
+//   "debug"      → reports the reasoning_effort and the active skill names it received
+//   "history"    → counts your messages and quotes the first one
+//   "usage"      → sends a final usage chunk (123 in / 45 out tokens)
 //
-// Agent scenarios (need /tools on; scripted tool calls, see agentScenario):
+// Agent scenarios (scripted tool calls, see agentScenario; all need /tools on except
+// mock:tick, mock:goal, mock:drop and mock:outage, and mock:pace inside a self-paced
+// /loop, which sends schedule_next even with tools off; mock:workflow needs /tools cmds
+// or yolo, the only modes that offer the workflow tool). The mock also answers /goal checks:
+// a goal is met once the agent's final reply contains GOAL-DONE.
 //   "mock:edit"     read_file → edit_file → run_command → summary (in a folder with calc.py)
 //   "mock:agents"   two parallel subagents, then a summary of their reports
 //   "mock:workflow" runs a workflow script: two parallel agents + a JSON-schema agent

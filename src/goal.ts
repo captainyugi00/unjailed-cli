@@ -7,8 +7,10 @@ import type { ToolEvent } from "./context.js";
  * After every turn an evaluator request judges the latest evidence (the
  * prompt, the tool calls and their results, and the reply) against the
  * condition. If it is not met, the agent gets the evaluator's reason and
- * continues on its own; the goal ends when it is met, when the user clears
- * it, or after `maxTurns` turns.
+ * continues on its own. The goal ends when it is met or the user clears it.
+ * It pauses (and /goal resume continues it) after `maxTurns` turns (default
+ * 20, set with --max N up to 100), or when a turn is stopped, errors, or the
+ * check itself fails.
  */
 export interface Goal {
   condition: string;

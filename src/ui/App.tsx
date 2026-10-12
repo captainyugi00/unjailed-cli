@@ -1229,7 +1229,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       list = all;
     }
     if (list.length === 0) {
-      info("No saved chats yet. Chats are saved automatically after each reply.");
+      info("No saved chats yet. Chats are saved automatically as you go, and every 10 seconds while the agent works.");
       return;
     }
     if (arg) {
@@ -2709,16 +2709,19 @@ function helpText(): string {
   const cmdW = Math.max(...COMMANDS.map((c) => `/${c.name}${c.args ? " " + c.args : ""}`.length)) + 3;
   const cmds = COMMANDS.map((c) => `${theme.brand(`/${c.name}${c.args ? " " + c.args : ""}`.padEnd(cmdW))}${c.description}`);
   const keys: [string, string][] = [
-    ["Enter", "Send message (while the agent works: deliver it at its next step)"],
+    ["Enter", "Send · while the agent works, messages reach it at its next step (queued if tools are off) and most /commands run at once"],
     ["Shift+Enter or \\ then Enter", "New line (Alt+Enter / Ctrl+J also work)"],
     ["↑ / ↓", "Previous / next input"],
+    ["Tab", "Complete the highlighted /command · select in pickers"],
+    ["Ctrl+A / Ctrl+E", "Start / end of line"],
+    ["Ctrl+U / Ctrl+K / Ctrl+W", "Delete to line start / to line end / previous word"],
     ["Space", "Toggle a skill in /skills"],
-    ["y / a / n", "Answer a permission prompt: yes · yes for the session · no"],
+    ["y / a / n  (1 / 2 / 3)", "Answer a permission prompt: yes · yes for the session · no (Esc = no); plan prompts take y / n or ←/→ + Enter"],
     ["Ctrl+T", "Expand or collapse the live agents view"],
     ["Ctrl+O", "Verbose: show thinking, subagent steps and full tool output"],
     ["Esc", "Close menus · while working, press twice to stop"],
-    ["Ctrl+C", "Stop the response · clear input · press twice to exit"],
-    ["Ctrl+D", "Exit"],
+    ["Ctrl+C", "Stop the response · close a picker · clear input · press twice to exit"],
+    ["Ctrl+D", "Exit (when the input is empty and nothing is running)"],
   ];
   const keyW = Math.max(...keys.map(([k]) => k.length)) + 3;
   return [

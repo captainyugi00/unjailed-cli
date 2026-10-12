@@ -9,7 +9,7 @@ export const AGENT_TOOL: ToolDef = {
   function: {
     name: "agent",
     description:
-      "Launch a subagent: a fresh agent with the same tools and an empty context that works autonomously on one focused task and returns a report. " +
+      "Launch a subagent: a fresh agent with the same file, search and command tools (it cannot launch further subagents or workflows) and an empty context that works autonomously on one focused task and returns a report. " +
       "Use it for independent work that would otherwise flood your context (broad searches, investigating several areas, reviewing a module). " +
       "Several agent calls in the same reply run in parallel. The subagent cannot see this conversation, so the prompt must contain everything it needs: the goal, relevant paths, constraints, and what to report back.",
     parameters: {
