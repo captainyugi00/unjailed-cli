@@ -20,6 +20,8 @@ export interface Goal {
 
 export const DEFAULT_GOAL_TURNS = 20;
 export const MAX_GOAL_TURNS = 100;
+/** Longest goal condition accepted by /goal. */
+export const MAX_GOAL_CHARS = 4000;
 
 export interface GoalVerdict {
   met: boolean;
@@ -37,7 +39,7 @@ export function parseGoalArgs(arg: string): { condition: string; maxTurns: numbe
     if (maxTurns < 1 || maxTurns > MAX_GOAL_TURNS) return { error: `--max must be between 1 and ${MAX_GOAL_TURNS}.` };
   }
   if (!text) return { error: "Describe the condition, e.g. /goal all tests in npm test pass" };
-  if (text.length > 2000) return { error: "Keep the goal under 2,000 characters." };
+  if (text.length > MAX_GOAL_CHARS) return { error: `Keep the goal to ${MAX_GOAL_CHARS.toLocaleString("en-US")} characters or fewer (it has ${text.length.toLocaleString("en-US")}).` };
   return { condition: text, maxTurns };
 }
 
@@ -53,7 +55,7 @@ const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + `…(+${s
 
 /** The evidence block the evaluator sees: bounded so it never dominates cost. */
 export function goalEvidence(prompt: string, events: ToolEvent[], reply: string, budget = 14_000): string {
-  const parts: string[] = [`LATEST INSTRUCTION:\n${clip(prompt, 2000)}`];
+  const parts: string[] = [`LATEST INSTRUCTION:\n${clip(prompt, 4500)}`];
   if (events.length) {
     const recent = events.slice(-25);
     const per = Math.max(200, Math.floor((budget - 6000) / recent.length));

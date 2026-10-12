@@ -22,7 +22,7 @@ import { createSkill, loadSkills, projectSkillsDir, skillsSystemPrompt, userSkil
 import { agentSystemPrompt } from "../system-prompt.js";
 import { DEFAULT_MODEL } from "../constants.js";
 import { renderMarkdown } from "../markdown.js";
-import { c, theme, tone } from "../theme.js";
+import { theme, tone } from "../theme.js";
 import { Header } from "./Header.js";
 import { FinishFlourish } from "./Snow.js";
 import { fxEnabled } from "./fx.js";
@@ -34,6 +34,7 @@ import { StreamDisplayBuffer, retainDisplayWindow, streamingRowBudget } from "./
 import { ActivityBar, agentsTable, formatElapsed, formatTokens, type AgentStat, type LiveView, type Phase, type Task, type TaskGroup } from "./ActivityBar.js";
 import { clip, describeAction, formatToolBlock, parseArgs, toolSummary, toolTitle } from "./tool-format.js";
 import { sanitizeForDisplay } from "./sanitize.js";
+import { Thinking } from "./Thinking.js";
 import {
   deleteSession,
   findSession,
@@ -2493,31 +2494,6 @@ function TranscriptItem({ item, width, gap }: { item: Item; width: number; gap: 
         </Box>
       );
   }
-}
-
-/** The model's thinking: dim italics under a ∴ gutter. While streaming,
- *  only the last `maxLines` rows are shown. */
-function Thinking({ text, width, maxLines }: { text: string; width: number; maxLines?: number }) {
-  const cols = Math.max(10, width - 2);
-  let body = sanitizeForDisplay(text).trim();
-  if (maxLines) {
-    const lines = body.split("\n").flatMap((l) => {
-      const out: string[] = [];
-      for (let i = 0; i < Math.max(1, l.length); i += cols - 1) out.push(l.slice(i, i + cols - 1));
-      return out;
-    });
-    body = (lines.length > maxLines ? "… " : "") + lines.slice(-maxLines).join("\n");
-  }
-  return (
-    <Box flexDirection="row">
-      <Box width={2} flexShrink={0}>
-        <Text>{tone.thinking("∴")}</Text>
-      </Box>
-      <Box width={cols}>
-        <Text>{tone.thinking(c.italic(body))}</Text>
-      </Box>
-    </Box>
-  );
 }
 
 /** An icon column plus text that wraps under itself, not under the icon. */

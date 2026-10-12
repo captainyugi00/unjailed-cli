@@ -22,7 +22,9 @@ test("goal arguments: condition, --max, and validation", () => {
   assert.ok("error" in parseGoalArgs("--max 5"));
   assert.ok("error" in parseGoalArgs("x --max 0"));
   assert.ok("error" in parseGoalArgs("x --max 1000"));
-  assert.ok("error" in parseGoalArgs("y".repeat(2001)));
+  assert.equal(parseGoalArgs("y".repeat(4000)).condition.length, 4000, "4,000 characters are accepted");
+  assert.match(parseGoalArgs("y".repeat(4001)).error, /4,000 characters or fewer \(it has 4,001\)/);
+  assert.equal(parseGoalArgs("z".repeat(3990) + " --max 5").maxTurns, 5, "--max still parsed on a long goal");
 });
 
 test("goal verdicts parse from JSON, fenced JSON, and loose replies", () => {
