@@ -1,0 +1,17 @@
+{
+  "version": "0.12.3",
+  "hostPlatform": "linux",
+  "realTerminal": true,
+  "localMockModelOnly": true,
+  "permissionPickerVisible": true,
+  "pickerCancellationRetainsReadOnly": true,
+  "deniedWriteCreatedFile": false,
+  "fileAndCommandRequiredSeparateApprovals": true,
+  "pythonProgramOutput": "a: b: 5.0\n\nExit code: 0",
+  "pythonInput": [
+    2,
+    3
+  ],
+  "customerMutations": 0,
+  "windowsPhysicalDeviceTested": false
+}
