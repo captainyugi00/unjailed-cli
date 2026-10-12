@@ -19,7 +19,7 @@
 //   "mock:agents"   two parallel subagents, then a summary of their reports
 //   "mock:workflow" runs a workflow script: two parallel agents + a JSON-schema agent
 //   "mock:goal"     replies "step N" until the goal continuation count reaches 2, then GOAL-DONE
-//   "mock:stall"    announces a step without a tool call (the CLI should nudge it on)
+//   "mock:stall"    announces a step without a tool call; ask it to "fix" something so the CLI nudges it on
 //   "mock:drop"     the first reply is cut off mid-stream (no [DONE]); the CLI should resume it
 //   "mock:outage"   the first two requests fail with 503; the CLI should retry and recover
 //   "mock:ansi"     runs a command whose output has colors, tabs and carriage returns

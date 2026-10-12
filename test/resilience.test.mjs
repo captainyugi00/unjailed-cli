@@ -136,22 +136,29 @@ test("finish_reason=length continues the reply instead of ending silently", asyn
 test("an agent that announces a step without acting is prompted to continue (bounded)", async () => {
   const exec = async () => ({ ok: true, output: "done" });
   const tools = [{ type: "function", function: { name: "read_file", description: "", parameters: {} } }];
+  const task = [{ role: "user", content: "fix the failing tests" }];
   await withFetch([text("Now I'll update the tests:"), toolCall([{ id: "c1", name: "read_file", args: "{}" }]), text("All finished.")], async (requests) => {
-    const r = await run([{ role: "user", content: "q" }], { tools, execute: exec });
+    const r = await run([...task], { tools, execute: exec });
     assert.equal(r.end, "done");
     assert.match(requests[1].messages.at(-1).content, /did not call a tool/);
     assert.equal(r.toolCalls, 1);
   });
   // Without tools there is nothing to nudge toward.
   await withFetch([text("Let me think:")], async (requests) => {
-    await run([{ role: "user", content: "q" }]);
+    await run([...task]);
     assert.equal(requests.length, 1);
   });
-  // At most two nudges, then the turn ends.
+  // A question or a task that asks for no action is a normal ending.
+  await withFetch([text("Let me know which file:")], async (requests) => {
+    await run([{ role: "user", content: "what does this repo do?" }], { tools, execute: exec });
+    assert.equal(requests.length, 1);
+  });
+  // At most two nudges, then the turn ends with a visible warning.
   await withFetch([text("Let me check:"), text("Next, I'll look:"), text("I will now go:")], async (requests) => {
-    const r = await run([{ role: "user", content: "q" }], { tools, execute: exec });
+    const r = await run([...task], { tools, execute: exec });
     assert.equal(requests.length, 3);
-    assert.equal(r.end, "done");
+    assert.equal(r.end, "gave-up");
+    assert.match(r.streamed, /no success is implied/);
   });
 });
 
