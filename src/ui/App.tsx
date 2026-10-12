@@ -394,6 +394,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
         const finalText = await agentTurn(baseUrl, auth.key, model, history, {
           ...streamHandlers,
+          onRecovery: (message) => info(message),
           onToolCall: (name, args) => {
             let argsObj: Record<string, unknown> = {};
             try { argsObj = JSON.parse(args || "{}"); } catch { /* raw */ }
@@ -470,7 +471,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
     if (outcome === "stopped") info("Stopped.");
     else if (outcome === "error") error(errMsg);
-    else if (!full.trim()) info("(no response text — the model may have hit its output limit mid-reasoning; try /effort medium or rephrase)");
+    else if (!full.trim()) info("(no response text — the model may have hit its output limit mid-reasoning; try /effort low or another model)");
     setBusy(null);
   };
 

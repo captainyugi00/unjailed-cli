@@ -1,5 +1,5 @@
 import { archivedContext, identifyHistoryEntry, isWorkingContext, protectWorkingContext } from "./context.js";
-import { REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, VERSION } from "./constants.js";
+import { REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, REASONING_TIMEOUT_MS, VERSION } from "./constants.js";
 
 export type Role = "system" | "user" | "assistant";
 export interface ChatMessage {
@@ -190,7 +190,7 @@ export async function streamChatRetry(
   messages: ChatMessage[],
   handlers: StreamHandlers,
   signal: AbortSignal,
-  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown } = {},
+  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown; reasoningTimeoutMs?: number } = {},
 ): Promise<AgentStreamResult | undefined> {
   try {
     return await streamChat(baseUrl, key, model, messages, handlers, signal, options);
@@ -213,7 +213,7 @@ export async function streamChat(
   messages: ChatMessage[],
   handlers: StreamHandlers,
   signal: AbortSignal,
-  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown } = {},
+  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown; reasoningTimeoutMs?: number } = {},
 ): Promise<AgentStreamResult | undefined> {
   const prepared = prepareRequestHistory(messages as AgentMessage[]);
   handlers.onRequest?.({ characters: prepared.messages.reduce((n, m) => n + msgSize(m), 0), messages: prepared.messages.length });
@@ -240,21 +240,23 @@ export async function streamChat(
     // Some servers ignore stream:true; accept a plain JSON completion too.
     try {
       const json = (await res.json()) as {
-        choices?: { message?: { content?: string; tool_calls?: Array<{ id?: string; index?: number; function?: { name?: string; arguments?: string } }> } }[];
+        choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: Array<{ id?: string; index?: number; function?: { name?: string; arguments?: string } }> } }[];
         usage?: unknown;
       };
       const usage = parseUsage(json.usage);
       if (usage) handlers.onUsage?.(usage);
       const msg = json.choices?.[0]?.message;
+      const reason = json.choices?.[0]?.finish_reason ?? null;
+      if (typeof msg?.content === "string") handlers.onToken(msg.content);
       if (msg?.tool_calls?.length) {
         const accum = new Map<number, ToolCallAccum>();
         msg.tool_calls.forEach((tc, i) => {
           accum.set(tc.index ?? i, { index: tc.index ?? i, id: tc.id, name: tc.function?.name, args: tc.function?.arguments ?? "{}" });
         });
-        return finishTools(accum, null, usage);
+        return finishTools(accum, reason, usage);
       }
       const text = msg?.content;
-      if (typeof text === "string") { handlers.onToken(text); return usage ? { toolCalls: [], usage } : undefined; }
+      if (typeof text === "string") return { toolCalls: [], usage, finishReason: reason };
     } catch {
       /* fall through */
     }
@@ -266,6 +268,9 @@ export async function streamChat(
   let buffer = "";
   let idleTimedOut = false;
   let idle: NodeJS.Timeout | undefined;
+  let reasoningTimer: NodeJS.Timeout | undefined;
+  let reasoningTimedOut = false;
+  let productive = false;
   const toolAccum = new Map<number, ToolCallAccum>();
   let finishReason: string | null = null;
   let usage: Usage | undefined;
@@ -277,61 +282,77 @@ export async function streamChat(
     }, STREAM_IDLE_TIMEOUT_MS);
   };
 
+  const processLine = (line: string): boolean => {
+    if (!line.startsWith("data:")) return false;
+    const data = line.slice(5).trim();
+    if (!data) return false;
+    if (data === "[DONE]") return true;
+    let evt: any;
+    try { evt = JSON.parse(data); } catch { throw new ApiError("The model sent a malformed stream chunk. No incomplete tool call was executed."); }
+    if (evt?.usage) {
+      const u = parseUsage(evt.usage);
+      if (u) { usage = u; handlers.onUsage?.(u); }
+    }
+    if (evt?.error) {
+      const m = typeof evt.error === "string" ? evt.error : evt.error.message;
+      throw new ApiError(m ? `The server reported an error: ${m}` : "The server reported an error mid-response.");
+    }
+    const choice = evt?.choices?.[0];
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+    const delta = choice?.delta ?? {};
+    const reasoning = delta.reasoning_content ?? delta.reasoning;
+    if (typeof reasoning === "string" && reasoning) handlers.onReasoning?.(reasoning);
+    if ((typeof delta.content === "string" && delta.content) || delta.tool_calls?.length) {
+      productive = true;
+      clearTimeout(reasoningTimer);
+    }
+    if (typeof delta.content === "string" && delta.content) handlers.onToken(delta.content);
+    if (Array.isArray(delta.tool_calls)) {
+      for (const [i, tc] of delta.tool_calls.entries()) {
+        const idx = typeof tc.index === "number" ? tc.index : i;
+        let slot = toolAccum.get(idx);
+        if (!slot) { slot = { index: idx, args: "" }; toolAccum.set(idx, slot); }
+        if (tc.id) slot.id = tc.id;
+        const name = tc.function?.name;
+        if (typeof name === "string" && name) {
+          if (!slot.name || name.startsWith(slot.name)) slot.name = name;
+          else if (name !== slot.name) slot.name += name;
+        }
+        if (typeof tc.function?.arguments === "string") slot.args += tc.function.arguments;
+      }
+    }
+    return false;
+  };
   try {
     armIdle();
+    // A heartbeat or continuous reasoning must not keep a request alive forever.
+    reasoningTimer = setTimeout(() => {
+      if (!productive) { reasoningTimedOut = true; controller.abort(); }
+    }, options.reasoningTimeoutMs ?? REASONING_TIMEOUT_MS);
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) break;
-      armIdle();
-      buffer += decoder.decode(value, { stream: true });
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      if (!done) armIdle();
       let nl: number;
       while ((nl = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, nl).replace(/\r$/, "");
         buffer = buffer.slice(nl + 1);
-        if (!line.startsWith("data:")) continue;
-        const data = line.slice(5).trim();
-        if (!data) continue;
-        if (data === "[DONE]") return finishTools(toolAccum, finishReason, usage);
-        let evt: any;
-        try {
-          evt = JSON.parse(data);
-        } catch {
-          continue;
-        }
-        if (evt?.usage) {
-          const u = parseUsage(evt.usage);
-          if (u) { usage = u; handlers.onUsage?.(u); }
-        }
-        if (evt?.error) {
-          const m = typeof evt.error === "string" ? evt.error : evt.error.message;
-          throw new ApiError(m ? `The server reported an error: ${m}` : "The server reported an error mid-response.");
-        }
-        const choice0 = evt?.choices?.[0];
-        if (choice0?.finish_reason) finishReason = choice0.finish_reason;
-        const delta = choice0?.delta ?? {};
-        const reasoning = delta.reasoning_content ?? delta.reasoning;
-        if (typeof reasoning === "string" && reasoning) handlers.onReasoning?.(reasoning);
-        if (typeof delta.content === "string" && delta.content) handlers.onToken(delta.content);
-        // OpenAI-style streamed tool calls: fragments keyed by index
-        if (Array.isArray(delta.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            const idx = typeof tc.index === "number" ? tc.index : 0;
-            let slot = toolAccum.get(idx);
-            if (!slot) { slot = { index: idx, args: "" }; toolAccum.set(idx, slot); }
-            if (tc.id) slot.id = tc.id;
-            if (tc.function?.name) slot.name = tc.function.name;
-            if (typeof tc.function?.arguments === "string") slot.args += tc.function.arguments;
-          }
-        }
+        if (processLine(line)) return finishTools(toolAccum, finishReason, usage);
+      }
+      if (done) {
+        if (buffer.trim()) processLine(buffer.replace(/\r$/, ""));
+        return finishTools(toolAccum, finishReason, usage);
       }
     }
-    return finishTools(toolAccum, finishReason, usage);
   } catch (err) {
     if (signal.aborted) throw new AbortedError();
+    if (reasoningTimedOut) throw new ApiError("The model produced no answer or tool call within the reasoning deadline. Completed work remains saved. Try /effort low or another model.");
     if (idleTimedOut) throw new ApiError("The response stalled and timed out. Try again.");
     throw networkError(err, baseUrl, false);
   } finally {
     clearTimeout(idle);
+    clearTimeout(reasoningTimer);
+    controller.abort();
     try {
       reader.releaseLock();
     } catch {
@@ -345,11 +366,11 @@ export async function streamChat(
 function finishTools(accum: Map<number, ToolCallAccum>, finishReason: string | null = null, usage?: Usage): AgentStreamResult | undefined {
   const calls: AgentStreamResult["toolCalls"] = [];
   for (const slot of [...accum.values()].sort((a, b) => a.index - b.index)) {
-    if (!slot.name) continue;
+    if (!slot.name) throw new ApiError("The model returned an incomplete tool call without a name. Nothing from that response was executed.");
     calls.push({ id: slot.id ?? `call_${slot.index}`, name: slot.name!, args: slot.args || "{}" });
   }
   if (calls.length) return { toolCalls: calls, finishReason, usage };
-  if (finishReason === "length" || usage) return { toolCalls: [], finishReason, usage };
+  if (finishReason || usage) return { toolCalls: [], finishReason, usage };
   return undefined;
 }
 
@@ -361,6 +382,7 @@ export type AgentMessage =
   | { role: "tool"; tool_call_id: string; content: string };
 
 export interface AgentHandlers extends StreamHandlers {
+  onRecovery?: (message: string) => void;
   onToolCall?: (name: string, args: string) => void;
   onToolResult?: (name: string, ok: boolean, output: string) => void;
 }
@@ -385,7 +407,10 @@ export async function agentTurn(
   // agent silently stop mid-task ("automode stops working after 5 minutes").
   const maxRounds = options.maxRounds ?? 40;
   let exhausted = false;
-  let lengthResumes = 0;
+  let resumes = 0;
+  let permissionBlocked = false;
+  const task = [...history].reverse().find(m => m.role === "user")?.content ?? "";
+  const actionable = /\b(fix|edit|write|create|make|build|implement|add|update|upgrade|wire|run|test|debug|refactor)\b/i.test(task);
   let lastText = "";
   for (let round = 0; round < maxRounds; round++) {
     exhausted = round === maxRounds - 1;
@@ -397,20 +422,24 @@ export async function agentTurn(
     }, signal, { effort: options.effort, tools: options.tools });
     lastText = roundText || lastText;
 
-    // length-finish with zero content = the model burned its entire token budget
-    // on hidden reasoning before writing a word (plan-execute pattern triggers this).
-    // Transparently resume with a "stop thinking, act now" nudge instead of
-    // returning an empty response. Max 2 resumes per turn.
-    if (res && res.finishReason === "length" && !roundText.trim() && res.toolCalls.length === 0) {
-      if (lengthResumes < 2) {
-        lengthResumes++;
-        handlers.onToken("\n*(resuming after long reasoning — continuing)*\n\n");
-        history.push({ role: "user", content: "Continue now. Skip any further deliberation: proceed directly with the task. If you were executing a plan, start step 1 immediately." });
+    const reasoningOnly = !roundText.trim() && res?.finishReason === "length";
+    const lastLine = roundText.trim().split("\n").filter(Boolean).at(-1) ?? "";
+    const promise = actionable && !!options.tools?.length && !permissionBlocked &&
+      !/[?`]/.test(lastLine) && !/\b(cannot|can't|unable|permission|approval|denied|blocked|done|finished|completed)\b/i.test(lastLine) &&
+      /^(?:let me|i(?:'ll| will| am going to)|now i(?:'ll| will))\b.{0,100}\b(start|begin|wire|wiring|edit|fix|implement|create|write|run|inspect|read|check|add|update)\b/i.test(lastLine);
+    if ((!res || !res.toolCalls.length) && (reasoningOnly || promise)) {
+      if (resumes < 2 && round < maxRounds - 1) {
+        resumes++;
+        handlers.onRecovery?.("The model stopped before acting; requesting an actual tool call.");
+        if (roundText.trim()) history.push({ role: "assistant", content: roundText });
+        history.push({ role: "user", content: "Continue the original task now. Use an available tool to perform the announced next step, respecting all permissions. If you cannot proceed, clearly state the blocker. Do not end with another promise to act." });
         continue;
       }
+      const warning = "\n\n[Model stopped without performing its announced action. Try another model or send continue; no success is implied.]";
+      handlers.onToken(warning);
+      return lastText + warning;
     }
-
-    if (!res || res.toolCalls.length === 0) return lastText;
+    if (!res || !res.toolCalls.length) return lastText;
 
     // record the assistant's tool_calls message
     history.push({
@@ -421,10 +450,15 @@ export async function agentTurn(
 
     for (const call of res.toolCalls) {
       if (signal.aborted) throw new AbortedError();
-      let args: Record<string, unknown> = {};
-      try { args = JSON.parse(call.args || "{}"); } catch { /* model sent bad json */ }
+      let args: Record<string, unknown> | undefined;
+      try {
+        const parsed = JSON.parse(call.args || "{}");
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) args = parsed;
+      } catch { /* Never execute guessed arguments. */ }
       handlers.onToolCall?.(call.name, call.args);
-      const result = await options.execute(call.name, args);
+      const result = args ? await options.execute(call.name, args) :
+        { ok: false, output: "Invalid or incomplete tool arguments. Nothing executed. Send a corrected JSON object." };
+      if (!result.ok && /declined|approval is unavailable|cancelled|unavailable in .* mode/i.test(result.output)) permissionBlocked = true;
       handlers.onToolResult?.(call.name, result.ok, result.output);
       const evidence: AgentMessage = { role: "tool", tool_call_id: call.id, content: result.output };
       if (result.historyEntry) identifyHistoryEntry(evidence, result.historyEntry);
@@ -432,7 +466,9 @@ export async function agentTurn(
     }
   }
   if (exhausted) {
-    lastText += "\n\n[task still in progress — send \"continue\" to keep going]";
+    const warning = "\n\n[task still in progress — send \"continue\" to keep going]";
+    handlers.onToken(warning);
+    lastText += warning;
   }
   return lastText;
 }

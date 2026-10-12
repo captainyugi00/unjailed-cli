@@ -18,6 +18,7 @@ export interface ToolDef {
 export type ToolsMode = "off" | "read" | "cmds" | "yolo";
 
 export const MAX_READ_BYTES = 200_000;      // 200 KB per file read
+export const MAX_EDIT_FILE_BYTES = 5_000_000; // targeted edits/range reads; full writes retain their smaller limit
 export const MAX_WRITE_BYTES = 200_000;     // 200 KB per file write
 export const MAX_RUN_OUTPUT = 30_000;       // chars of stdout/stderr kept
 export const MAX_TOOL_OUTPUT = 28_000;      // HARD cap: upstream rejects strings > 32k — never send more
@@ -36,10 +37,10 @@ export function toolDefinitions(mode: ToolsMode): ToolDef[] {
       type: "function",
       function: {
         name: "read_file",
-        description: "Read a UTF-8 text file from the user's machine. Paths are relative to the current directory unless absolute.",
+        description: "Read a UTF-8 text file. Use start_line and max_lines to inspect later sections or large files. Paths are relative to the current directory unless absolute.",
         parameters: {
           type: "object",
-          properties: { path: { type: "string", description: "File path to read" } },
+          properties: { path: { type: "string", description: "File path to read" }, start_line: { type: "integer", minimum: 1, description: "First line, 1-based" }, max_lines: { type: "integer", minimum: 1, maximum: 500, description: "Number of lines (default 200 for ranged reads)" } },
           required: ["path"],
         },
       },
@@ -464,9 +465,26 @@ export async function executeTool(
       const file = resolveToolPath(p, cwd);
       const stat = fs.statSync(file);
       if (stat.isDirectory()) return { ok: false, output: `${p} is a directory (use list_dir)` };
-      if (stat.size > MAX_READ_BYTES) return { ok: false, output: `${p} is ${stat.size} bytes — too large (limit ${MAX_READ_BYTES})` };
+      const ranged = args.start_line !== undefined || args.max_lines !== undefined;
+      const start = args.start_line ?? 1;
+      const count = args.max_lines ?? 200;
+      if (!Number.isInteger(start) || Number(start) < 1 || !Number.isInteger(count) || Number(count) < 1 || Number(count) > 500) return { ok: false, output: "start_line must be a positive integer; max_lines must be between 1 and 500." };
+      if (stat.size > MAX_EDIT_FILE_BYTES) return { ok: false, output: `${p} exceeds the ${MAX_EDIT_FILE_BYTES}-byte range-read limit.` };
+      if (stat.size > MAX_READ_BYTES && !ranged) return { ok: false, output: `${p} is ${stat.size} bytes. Read a section with start_line and max_lines.` };
       const data = fs.readFileSync(file, "utf8");
-      return { ok: true, output: clip(data) };
+      if (!ranged && data.length <= MAX_TOOL_OUTPUT) return { ok: true, output: data };
+      const lines = data.split("\n");
+      if (Number(start) > lines.length) return { ok: false, output: `start_line exceeds ${lines.length} lines.` };
+      let end = Number(start) - 1;
+      let text = "";
+      while (end < lines.length && end < Number(start) - 1 + Number(count)) {
+        const line = lines[end]!;
+        if (text.length + line.length + 1 > MAX_TOOL_OUTPUT - 200) break;
+        text += (text ? "\n" : "") + line;
+        end++;
+      }
+      if (end === Number(start) - 1) return { ok: false, output: "This single line exceeds the tool output limit. Search for a smaller anchor with grep." };
+      return { ok: true, output: `[${p}: lines ${start}-${end} of ${lines.length}${end < lines.length ? `; next start_line=${end + 1}` : ""}]\n${text}` };
     }
 
     if (name === "list_dir") {
@@ -637,12 +655,24 @@ export async function executeTool(
       const replaceAll = args.replace_all === true;
       if (!p || !oldText) return { ok: false, output: "path and old_text are required" };
       const file = resolveToolPath(p, cwd);
+      if (fs.statSync(file).size > MAX_EDIT_FILE_BYTES) return { ok: false, output: `File exceeds ${MAX_EDIT_FILE_BYTES} bytes; nothing written.` };
+      if (Buffer.byteLength(newText) > MAX_WRITE_BYTES) return { ok: false, output: "Replacement exceeds the write limit; nothing written." };
       const src = fs.readFileSync(file, "utf8");
-      const count = src.split(oldText).length - 1;
-      if (count === 0) return { ok: false, output: `old_text not found in ${p} — nothing written.` };
+      // Only tolerate LF/CRLF differences, never guessed whitespace or fuzzy anchors.
+      const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      let pattern = new RegExp(escape(oldText), "g");
+      let count = [...src.matchAll(pattern)].length;
+      if (!count && oldText.includes("\n")) {
+        pattern = new RegExp(oldText.replace(/\r\n/g, "\n").split("\n").map(escape).join("\r?\n"), "g");
+        count = [...src.matchAll(pattern)].length;
+      }
+      if (count === 0) return { ok: false, output: `old_text not found in ${p} — nothing written. Read the current lines before retrying.` };
       if (count > 1 && !replaceAll) return { ok: false, output: `old_text found ${count} times in ${p} — pass replace_all or make it more specific.` };
-      const next = replaceAll ? src.split(oldText).join(newText) : src.replace(oldText, newText);
-      if (Buffer.byteLength(next) > MAX_WRITE_BYTES) return { ok: false, output: `Edited content exceeds ${MAX_WRITE_BYTES} bytes; nothing written.` };
+      const crlf = src.includes("\r\n") && !/(?<!\r)\n/.test(src);
+      const replacement = crlf ? newText.replace(/\r?\n/g, "\r\n") : newText;
+      // Callback keeps $&, $', $` and $$ literal in source code.
+      const next = src.replace(pattern, () => replacement);
+      if (Buffer.byteLength(next) > MAX_EDIT_FILE_BYTES) return { ok: false, output: `Edited content exceeds ${MAX_EDIT_FILE_BYTES} bytes; nothing written.` };
       fs.writeFileSync(file, next);
       return { ok: true, output: count > 1 && !replaceAll ? `Replaced 1 of ${count} occurrences in ${p}` : `Replaced ${replaceAll ? count : 1} occurrence${replaceAll && count > 1 ? "s" : ""} in ${p}` };
     }

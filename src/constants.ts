@@ -25,3 +25,6 @@ export const VERSION: string = (() => {
     return "0.0.0";
   }
 })();
+
+const reasoningSeconds = Number(process.env.UNJAILED_REASONING_TIMEOUT);
+export const REASONING_TIMEOUT_MS = (Number.isFinite(reasoningSeconds) && reasoningSeconds > 0 ? reasoningSeconds : 180) * 1000;

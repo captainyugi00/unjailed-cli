@@ -260,3 +260,11 @@ The default API URL is set in `src/constants.ts` (`DEFAULT_BASE_URL`).
 ## License
 
 MIT · [github.com/unjailedai/unjailedCLI](https://github.com/unjailedai/unjailedCLI)
+
+### Coding reliability (0.12.4)
+
+Update with `/update` or `npm install -g unjailed@latest`. Enable file and command access with `/tools cmds`; every change and command still asks for approval unless you explicitly enable automatic approval.
+
+The CLI now continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
+
+GLM 5.3 CLI requests default to low reasoning on the hosted API. `/effort high` remains available; the CLI's medium level maps to GLM's high level. Streams producing no answer or tool call stop after 180 seconds by default. Set `UNJAILED_REASONING_TIMEOUT` in seconds to override that deadline; `UNJAILED_TIMEOUT` controls header and idle timeouts (default 120 seconds). These controls improve response handling but cannot guarantee a model completes every task.
