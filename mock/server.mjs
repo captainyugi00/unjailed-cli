@@ -25,6 +25,8 @@
 //   "mock:ansi"     runs a command whose output has colors, tabs and carriage returns
 //   "mock:tick"     answers "tick N" (for /loop)
 //   "mock:emoji"    a reply full of emoji with variation selectors (layout drift)
+//   "mock:flaky"    every agent's first request reports "The model stream was interrupted"
+//   "mock:batch"    three tool calls in one reply (type a message while the first runs)
 //   "mock:pace"     self-paced loop: schedule_next 60s on the first run, stop:true afterwards
 
 import http from "node:http";
@@ -122,6 +124,8 @@ const EMOJI_REPLY = [
   "Done ✔️.",
 ].join("\n");
 
+const INTERRUPTED = "The model stream was interrupted. Retry to continue.";
+
 const WORKFLOW_SCRIPT = `export const meta = { name: "mock-review", description: "Two reviewers in parallel, then a JSON verdict", phases: [{ title: "Review" }, { title: "Verdict" }] };
 phase("Review");
 const reports = await parallel(["alpha", "beta"].map((area) => () => agent("mock-sub review area " + area, { label: "review " + area, phase: "Review" })));
@@ -153,6 +157,12 @@ function agentScenario(body) {
     const met = /AGENT'S FINAL REPLY:[\s\S]*GOAL-DONE/.test(lastUser);
     return { text: JSON.stringify({ met, reason: met ? "The agent reported GOAL-DONE." : "GOAL-DONE has not appeared yet." }) };
   }
+  // mock:flaky — every agent's first request fails the way the hosted API does:
+  // the stream reports "The model stream was interrupted. Retry to continue."
+  if (/mock:flaky/.test(String(msgs.find((m) => m.role === "user" && /mock:/.test(String(m.content)))?.content ?? "")) || /mock-flaky/.test(lastUser)) {
+    const key = `flaky:${/You are a subagent/.test(system) ? lastUser : "main"}`;
+    if (bump(key) === 1) return /You are a subagent/.test(system) ? { streamError: INTERRUPTED } : { text: "Starting the work, ", streamError: INTERRUPTED };
+  }
   if (/You are a subagent/.test(system)) {
     if (/json verdict/.test(lastUser)) return { text: "```json\n{\"ok\": true, \"count\": 2}\n```" };
     if (!toolsSince.length) return { text: "Looking around first.", toolCalls: [call("list_dir", { path: "." })] };
@@ -166,6 +176,15 @@ function agentScenario(body) {
     if (round === 1) return { text: "Found it: `add` subtracts. Fixing:", toolCalls: [call("edit_file", { path: "calc.py", old_text: "    return a-b", new_text: "    return a+b" })] };
     if (round === 2) return { text: "Verifying.", toolCalls: [call("run_command", { command: "python3 -c 'import calc; print(calc.add(2,3))'" })] };
     return { text: "Fixed `calc.py:2` — `add(2, 3)` now prints **5**.\n\n| File | Change |\n|---|---|\n| calc.py | `a-b` → `a+b` |" };
+  }
+  if (/mock:batch/.test(firstUser)) {
+    // One reply with three tool calls; the first takes a second, leaving time to type.
+    if (!msgs.some((m) => m.role === "tool")) return { text: "Running three steps.", toolCalls: [call("run_command", { command: "sleep 1 && echo one" }), call("run_command", { command: "echo two" }), call("run_command", { command: "echo three" })] };
+    return { text: /Sent by the user while you were working/.test(allText) ? "Re-planned with your message." : "All three steps ran." };
+  }
+  if (/mock:flaky/.test(firstUser)) {
+    if (round === 0) return { text: "then splitting it across two subagents.", toolCalls: [call("agent", { description: "Flaky left", prompt: "mock-flaky inspect left" }), call("agent", { description: "Flaky right", prompt: "mock-flaky inspect right" })] };
+    return { text: `Both flaky subagents reported back:\n\n${toolsSince.map((t) => "- " + t.content.split("\n")[0]).join("\n")}` };
   }
   if (/mock:agents/.test(firstUser)) {
     if (round === 0) return { text: "Splitting this across two subagents.", toolCalls: [call("agent", { description: "Inspect left side", prompt: "mock-sub inspect left" }), call("agent", { description: "Inspect right side", prompt: "mock-sub inspect right" })] };
@@ -230,6 +249,11 @@ const server = http.createServer(async (req, res) => {
       const chunk = (delta, finish = null) => res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", model: body.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
       await sleep(250);
       for (const t of tokens(scenario.text ?? "")) { chunk({ content: t }); await sleep(12); }
+      if (scenario.streamError) {
+        res.write(`data: ${JSON.stringify({ error: { message: scenario.streamError, type: "server_error" } })}\n\n`);
+        res.end();
+        return;
+      }
       if (scenario.drop) { await sleep(100); res.destroy(); return; }
       (scenario.toolCalls ?? []).forEach((c, index) => chunk({ tool_calls: [{ index, id: c.id, type: "function", function: { name: c.name, arguments: c.args } }] }));
       chunk({}, scenario.toolCalls?.length ? "tool_calls" : "stop");

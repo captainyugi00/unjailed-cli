@@ -16,10 +16,24 @@ export class ApiError extends Error {
     public retryAfter?: number,
     /** Retrying cannot help (bad response shape, TLS, a server-reported error). */
     public permanent = false,
+    opts: {
+      /** Retry even though the status alone would say otherwise. */
+      retryable?: boolean;
+      /** Give up after this many retries (a glitch that may repeat). */
+      retryLimit?: number;
+      /** A machine-readable kind, e.g. "reasoning-deadline". */
+      code?: string;
+    } = {},
   ) {
     super(message);
     this.name = "ApiError";
+    this.retryable = opts.retryable;
+    this.retryLimit = opts.retryLimit;
+    this.code = opts.code;
   }
+  retryable?: boolean;
+  retryLimit?: number;
+  code?: string;
 }
 
 export class AbortedError extends Error {
@@ -69,8 +83,9 @@ async function httpError(res: Response): Promise<ApiError> {
       return new ApiError(`Rate limited.${msg ? " " + msg : hint}`, res.status, after);
     }
     default:
-      if (res.status >= 500) return new ApiError(`The server had a problem (HTTP ${res.status}).`, res.status);
-      return new ApiError(msg ? `Request failed: ${msg}` : `Request failed (HTTP ${res.status}).`, res.status);
+      if (res.status >= 500) return new ApiError(`The server had a problem (HTTP ${res.status})${msg ? `: ${msg}` : "."}`, res.status);
+      // Some gateways answer an upstream interruption with a 4xx; trust the message.
+      return new ApiError(msg ? `Request failed: ${msg}` : `Request failed (HTTP ${res.status}).`, res.status, undefined, false, { retryable: !!msg && RETRY_HINT.test(msg) && !PERMANENT_SERVER_ERROR.test(msg) });
   }
 }
 
@@ -207,16 +222,44 @@ function parseUsage(raw: unknown): Usage | undefined {
   return reasoning > 0 ? { prompt, completion, total, reasoning } : { prompt, completion, total };
 }
 
+/** Errors the server reports inside a response body (an SSE `error` event or
+ *  a JSON `{ error }`). Many are transient (the upstream model stream was
+ *  interrupted, overloaded, timed out) and must be retried like an outage;
+ *  others (context too long, invalid request, no credit) never succeed. */
+const TRANSIENT_SERVER_ERROR = /interrupt|retry|try again|temporar|overload|unavailable|capacity|busy|timed? ?out|timeout|rate.?limit|too many requests|upstream|connection|reset|socket|network|internal (server )?error|bad gateway|gateway|server error|stream (was |got )?(closed|ended|terminated|aborted|cut)|disconnect|unexpected(ly)? (end|eof)|eof/i;
+const PERMANENT_SERVER_ERROR = /context|too long|maximum.*tokens|token limit|invalid|not found|does not exist|unsupported|content (policy|filter)|safety|moderation|unauthori[sz]ed|forbidden|api key|credit|quota|billing|payment/i;
+
+/** A 4xx is retried only when its message explicitly says the failure is temporary. */
+const RETRY_HINT = /interrupt|retry|try again|temporar|overload|unavailable|timed? ?out|timeout/i;
+
+export function serverReportedError(raw: unknown): ApiError {
+  const e = (typeof raw === "string" ? { message: raw } : raw ?? {}) as { message?: unknown; code?: unknown; type?: unknown; status?: unknown };
+  const message = typeof e.message === "string" && e.message.trim() ? e.message.trim() : "";
+  const status = Number(typeof e.status === "number" ? e.status : typeof e.code === "number" ? e.code : /^\d{3}$/.test(String(e.code ?? "")) ? e.code : NaN);
+  const kind = `${typeof e.type === "string" ? e.type : ""} ${typeof e.code === "string" ? e.code : ""}`;
+  const text = `${message} ${kind}`;
+  let transient: boolean;
+  if (Number.isFinite(status)) transient = status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+  else if (PERMANENT_SERVER_ERROR.test(text)) transient = false;
+  else transient = TRANSIENT_SERVER_ERROR.test(text) || /server_error|overloaded|api_error|timeout/i.test(kind);
+  const shown = message ? `The server reported an error: ${message}` : "The server reported an error mid-response.";
+  return new ApiError(shown, undefined, undefined, !transient);
+}
+
 /** A failure worth waiting out: the network, a timeout, an overloaded or
  *  rate-limited server. Bad keys, no credit and malformed requests are not. */
 export function isTransient(err: unknown): boolean {
   if (err instanceof AbortedError) return false;
   if (!(err instanceof ApiError)) return false;
+  if (err.retryable) return true;
   if (err.permanent) return false;
   const status = err.status;
   if (status === undefined) return true; // network, timeout, stall, dropped connection
-  return status === 408 || status === 409 || status === 425 || status === 429 || status >= 500;
+  return status === 408 || status === 409 || status === 425 || status === 429 || status === 499 || status >= 500;
 }
+
+/** How long to wait before retry `attempt` (1-based). */
+export type Backoff = (attempt: number, retryAfterSeconds?: number) => number;
 
 /** Exponential backoff: 1s, 2s, 4s … capped at 60s, with ±20% jitter. */
 export function backoffMs(attempt: number, retryAfterSeconds?: number): number {
@@ -248,9 +291,10 @@ export async function streamChatRetry(
   messages: ChatMessage[],
   handlers: StreamHandlers,
   signal: AbortSignal,
-  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown; reasoningTimeoutMs?: number; maxAttempts?: number } = {},
+  options: { effort?: string; tools?: unknown[]; toolChoice?: unknown; reasoningTimeoutMs?: number; maxAttempts?: number; backoff?: Backoff } = {},
 ): Promise<AgentStreamResult> {
   const maxAttempts = options.maxAttempts ?? Infinity;
+  const delayFor = options.backoff ?? backoffMs;
   for (let attempt = 1; ; attempt++) {
     let produced = false;
     const watched: StreamHandlers = {
@@ -269,7 +313,8 @@ export async function streamChatRetry(
       // The caller (the agent loop) reports the interruption and resumes it.
       if (produced) return { toolCalls: [], finishReason: null, incomplete: true };
       if (attempt >= maxAttempts) throw err;
-      const delay = backoffMs(attempt, err instanceof ApiError ? err.retryAfter : undefined);
+      if (err instanceof ApiError && err.retryLimit !== undefined && attempt > err.retryLimit) throw err;
+      const delay = delayFor(attempt, err instanceof ApiError ? err.retryAfter : undefined);
       handlers.onRetry?.({ attempt, delayMs: delay, reason: err instanceof Error ? err.message : "Request failed", until: Date.now() + delay });
       await sleepAbortable(delay, signal);
     }
@@ -317,7 +362,7 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
     return r;
   };
   if (!res.ok) throw await httpError(res);
-  if (!res.body) throw new ApiError("The server returned an empty response.");
+  if (!res.body) throw new ApiError("The server returned an empty response.", undefined, undefined, false, { retryLimit: 3 });
 
   const contentType = res.headers.get("content-type") ?? "";
   if (!contentType.includes("event-stream")) {
@@ -325,12 +370,14 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
     let json: {
       choices?: { finish_reason?: string; message?: { content?: string; tool_calls?: Array<{ id?: string; index?: number; function?: { name?: string; arguments?: string } }> } }[];
       usage?: unknown;
+      error?: unknown;
     };
     try {
       json = await res.json();
     } catch {
       throw new ApiError("The server sent an unexpected response. Check the base URL (/api).", undefined, undefined, true);
     }
+    if (json?.error) throw serverReportedError(json.error);
     const usage = parseUsage(json.usage);
     const msg = json.choices?.[0]?.message;
     const reason = json.choices?.[0]?.finish_reason ?? null;
@@ -376,17 +423,18 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
       evt = JSON.parse(data);
     } catch {
       // A torn chunk could hold part of a tool call; never guess at it.
-      throw new ApiError("The model sent a malformed stream chunk. No incomplete tool call was executed.", undefined, undefined, true);
+      throw new ApiError("The model sent a malformed stream chunk. No incomplete tool call was executed.", undefined, undefined, false, { retryLimit: 3 });
     }
     if (evt?.usage) {
       const u = parseUsage(evt.usage);
       if (u) usage = u;
     }
-    if (evt?.error) {
-      const m = typeof evt.error === "string" ? evt.error : evt.error.message;
-      throw new ApiError(m ? `The server reported an error: ${m}` : "The server reported an error mid-response.", undefined, undefined, true);
-    }
+    // "The model stream was interrupted. Retry to continue." arrives this way:
+    // transient errors are retried (or resumed after partial output), the
+    // rest stop with the server's message.
+    if (evt?.error) throw serverReportedError(evt.error);
     const choice = evt?.choices?.[0];
+    if (choice?.finish_reason === "error") throw serverReportedError(choice.error ?? "The model stream ended with an error. Retry to continue.");
     if (choice?.finish_reason) finishReason = choice.finish_reason;
     const delta = choice?.delta ?? {};
     const reasoning = delta.reasoning_content ?? delta.reasoning;
@@ -423,6 +471,8 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
     }, reasoningTimeoutMs);
     for (;;) {
       const { value, done } = await reader.read();
+      // Don't rely on the abort alone to end the body: stop reading once a timer fired.
+      if (reasoningTimedOut || idleTimedOut) throw new Error("timed out");
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       if (!done) armIdle();
       let nl: number;
@@ -442,13 +492,15 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
     }
   } catch (err) {
     if (signal.aborted) throw new AbortedError();
-    if (reasoningTimedOut) throw new ApiError("The model produced no answer or tool call within the reasoning deadline. Completed work remains saved. Try /effort low or another model.", undefined, undefined, true);
+    if (reasoningTimedOut) throw new ApiError("The model produced no answer or tool call within the reasoning deadline. Completed work remains saved. Try /effort low or another model.", undefined, undefined, true, { code: "reasoning-deadline" });
     if (idleTimedOut) throw new ApiError("The response stalled and timed out. Try again.");
     throw networkError(err, baseUrl, false);
   } finally {
     clearTimeout(idle);
     clearTimeout(reasoningTimer);
     controller.abort();
+    // Stop the body itself too: not every stream source honours the abort.
+    reader.cancel().catch(() => {});
     try {
       reader.releaseLock();
     } catch {
@@ -461,7 +513,7 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
 function finishTools(accum: Map<number, ToolCallAccum>, finishReason: string | null = null, usage?: Usage): AgentStreamResult {
   const calls: AgentStreamResult["toolCalls"] = [];
   for (const slot of [...accum.values()].sort((a, b) => a.index - b.index)) {
-    if (!slot.name) throw new ApiError("The model returned an incomplete tool call without a name. Nothing from that response was executed.", undefined, undefined, true);
+    if (!slot.name) throw new ApiError("The model returned an incomplete tool call without a name. Nothing from that response was executed.", undefined, undefined, false, { retryLimit: 2 });
     calls.push({ id: slot.id ?? `call_${slot.index}`, name: slot.name!, args: slot.args || "{}" });
   }
   return { toolCalls: calls, finishReason, usage };
@@ -493,7 +545,7 @@ export interface AgentTurnResult {
 }
 
 const MAX_EMPTY_CLOSES = 12; // ~8 minutes of backoff
-const MAX_CUT_OFFS = 10;
+const MAX_CUT_OFFS = 12; // with backoff, several minutes of an unstable upstream
 const CONTINUE_CUT_OFF = "Your previous reply was cut off before it finished. Continue exactly where it stopped. Do not repeat text you already wrote.";
 const CONTINUE_LENGTH = "You hit the output limit mid-reply. Continue exactly where you stopped. Do not repeat text you already wrote. Split large files into several smaller edits.";
 const CONTINUE_REASONING = "Continue now. Skip further deliberation and proceed directly with the task.";
@@ -527,11 +579,17 @@ export async function agentTurn(
     /** Tool calls for which this returns true run concurrently when adjacent. */
     parallelSafe?: (name: string) => boolean;
     execute?: (name: string, args: Record<string, unknown>, id: string) => Promise<{ ok: boolean; output: string; historyEntry?: string }>;
-    /** Messages the user typed mid-turn, delivered after the current tool step. */
+    /** Messages the user typed mid-turn, delivered after the current tool. */
     interject?: () => string[];
+    /** Retry pacing (tests use a fast one). */
+    backoff?: Backoff;
+    /** How long a request may produce only reasoning (default UNJAILED_REASONING_TIMEOUT). */
+    reasoningTimeoutMs?: number;
   },
 ): Promise<AgentTurnResult> {
   const maxRounds = options.maxRounds ?? 100;
+  const delayFor = options.backoff ?? backoffMs;
+  let deadlines = 0; // reasoning-deadline recoveries
   const hasTools = !!options.tools?.length && !!options.execute;
   let recoveries = 0; // length / reasoning-only resumes
   let emptyCloses = 0; // streams closed before any output, in a row
@@ -553,10 +611,22 @@ export async function agentTurn(
   for (let round = 0; round < maxRounds; round++) {
     if (signal.aborted) throw new AbortedError();
     let roundText = "";
-    const res = await streamChatRetry(baseUrl, key, model, history as ChatMessage[], {
-      ...handlers,
-      onToken: (t) => { roundText += t; handlers.onToken(t); },
-    }, signal, { effort: options.effort, tools: hasTools ? options.tools : undefined });
+    let res: AgentStreamResult;
+    try {
+      res = await streamChatRetry(baseUrl, key, model, history as ChatMessage[], {
+        ...handlers,
+        onToken: (t) => { roundText += t; handlers.onToken(t); },
+      }, signal, { effort: options.effort, tools: hasTools ? options.tools : undefined, backoff: options.backoff, reasoningTimeoutMs: options.reasoningTimeoutMs });
+    } catch (err) {
+      // A model that only deliberates past the deadline is asked to act now,
+      // rather than ending the turn.
+      if (err instanceof ApiError && err.code === "reasoning-deadline" && deadlines++ < 2) {
+        answer += roundText;
+        resume(roundText, CONTINUE_REASONING, "The model reasoned past the deadline without acting — asking it to proceed.");
+        continue;
+      }
+      throw err;
+    }
     answer += roundText;
 
     if (res.incomplete && !res.toolCalls.length) {
@@ -564,7 +634,7 @@ export async function agentTurn(
         // Closed before a single token: usually an outage. Wait it out, but a
         // server that always does this (a filter, a broken proxy) must not spin forever.
         if (++emptyCloses > MAX_EMPTY_CLOSES) throw new ApiError(`The server closed the stream without replying ${MAX_EMPTY_CLOSES} times in a row. Send "continue" to try again, or try another /model.`, undefined, undefined, true);
-        const delay = backoffMs(emptyCloses);
+        const delay = delayFor(emptyCloses);
         handlers.onRetry?.({ attempt: emptyCloses, delayMs: delay, reason: "The server closed the stream without replying", until: Date.now() + delay });
         await sleepAbortable(delay, signal);
         round--; // waiting out an outage is not a round of work
@@ -572,7 +642,13 @@ export async function agentTurn(
       }
       emptyCloses = 0;
       if (++cutOffs > MAX_CUT_OFFS) return { text: answer, end: "gave-up", rounds: round + 1, toolCalls };
-      resume(roundText, CONTINUE_CUT_OFF, "The connection closed mid-reply — resuming where it stopped.");
+      resume(roundText, CONTINUE_CUT_OFF, "The reply was interrupted — resuming where it stopped.");
+      // Repeated interruptions usually mean an unstable upstream: wait a bit longer each time.
+      if (cutOffs > 1) {
+        const delay = delayFor(cutOffs - 1);
+        handlers.onRetry?.({ attempt: cutOffs, delayMs: delay, reason: "The reply keeps getting interrupted", until: Date.now() + delay });
+        await sleepAbortable(delay, signal);
+      }
       continue;
     }
     emptyCloses = 0;
@@ -621,9 +697,23 @@ export async function agentTurn(
 
     // Adjacent parallel-safe calls (subagents) run together; everything else
     // runs one at a time. Results go back in the order the model asked.
+    // A message the user sends meanwhile is delivered after the tool that is
+    // running: the rest of this batch was planned without it, so those calls
+    // are skipped (and reported as such) and the model re-plans with it.
     const calls = res.toolCalls;
+    let delivered: string[] = [];
     for (let i = 0; i < calls.length;) {
       if (signal.aborted) throw new AbortedError();
+      if (i > 0) delivered = options.interject?.() ?? [];
+      if (delivered.length) {
+        for (const call of calls.slice(i)) {
+          const output = "Not run: the user sent a new message before this step. Re-plan with it; repeat this call only if it is still needed.";
+          handlers.onToolCall?.(call.name, call.args, call.id);
+          handlers.onToolResult?.(call.name, false, output, call.id);
+          history.push({ role: "tool", tool_call_id: call.id, content: output });
+        }
+        break;
+      }
       let j = i + 1;
       if (options.parallelSafe?.(calls[i]!.name)) while (j < calls.length && options.parallelSafe(calls[j]!.name)) j++;
       const group = calls.slice(i, j);
@@ -655,7 +745,8 @@ export async function agentTurn(
       });
       i = j;
     }
-    for (const text of options.interject?.() ?? []) {
+    if (!delivered.length) delivered = options.interject?.() ?? [];
+    for (const text of delivered) {
       history.push({ role: "user", content: `[Sent by the user while you were working — take it into account now]\n${text}` });
     }
   }

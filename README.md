@@ -117,8 +117,10 @@ Every turn ends with a line saying what happened: `✻ Worked for 1m 12s · 9 to
 calls · ↓ 3.4k tokens`, or why it stopped. A turn never ends silently.
 
 **Messages while the agent works.** Type and press Enter at any time. With
-tools on, your message goes to the agent at its next step, so you can steer
-it mid-task. Commands and plain-chat messages queue and run when the turn ends.
+tools on, your message reaches the agent as soon as the tool that is running
+finishes, so you can steer it mid-task. If the agent had planned more tool
+calls in the same batch, those are skipped and reported to it, and it
+re-plans with your message. Commands and plain-chat messages queue and run when the turn ends.
 
 **Permission prompts** show the exact command, file content or diff. Press `y`
 to allow it once, `a` to allow that tool for the rest of the session, or `n`/Esc
@@ -128,11 +130,15 @@ never taken as an answer), and Enter sends it.
 ## Reliability
 
 - **Outages are waited out, not fatal.** Network errors, timeouts, stalled
-  streams, `5xx`, `429` and overload responses are retried automatically with
-  exponential backoff (1s, 2s, 4s … up to 60s, honoring `Retry-After`) until
-  the service answers. The status line shows a countdown. Esc Esc stops waiting.
-  Invalid keys, missing credit and malformed requests stop at once with a clear
-  message.
+  streams, `5xx`, `429`, overload responses, and errors the server reports
+  inside a stream (such as "The model stream was interrupted. Retry to
+  continue.") are retried automatically with exponential backoff (1s, 2s, 4s …
+  up to 60s, honoring `Retry-After`) until the service answers. This applies
+  everywhere: the main agent, subagents, workflow agents, goal checks and plan
+  drafts. The status line shows a countdown. Esc Esc stops waiting. Invalid
+  keys, missing credit, over-long context and malformed requests stop at once
+  with a clear message. A model that only deliberates past the reasoning
+  deadline is asked to act instead of the turn ending.
 - **Cut-off replies are resumed.** If a stream ends early or the connection
   drops mid-reply, the agent continues from where it stopped instead of
   starting over, and you see a note saying so.
@@ -363,7 +369,7 @@ UNJAILED_BASE_URL=http://localhost:8787/v1 UNJAILED_HOME=./.dev node dist/index.
 npm test          # unit + integration tests against the mock
 ```
 
-Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:emoji`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
+Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:emoji`, `mock:flaky`, `mock:batch`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
 
 The CLI continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
 

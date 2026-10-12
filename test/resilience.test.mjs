@@ -51,7 +51,7 @@ const run = (history, extra = {}, handlers = {}) => {
     onNotice: (n) => notices.push(n),
     onRetry: (r) => retries.push(r),
     ...handlers,
-  }, extra.signal ?? new AbortController().signal, extra).then((r) => ({ ...r, notices, retries, streamed }));
+  }, extra.signal ?? new AbortController().signal, { backoff: extra.slow ? undefined : () => 5, ...extra }).then((r) => ({ ...r, notices, retries, streamed }));
 };
 
 test("a stream that closes without [DONE] mid-reply is resumed, not treated as finished", async () => {
@@ -80,7 +80,7 @@ test("a network error after text has streamed resumes from the partial reply", a
 test("transient HTTP errors are retried with backoff until the service recovers", async () => {
   await withFetch([status(503), status(502), text("back")], async (requests) => {
     const t0 = Date.now();
-    const r = await run([{ role: "user", content: "q" }]);
+    const r = await run([{ role: "user", content: "q" }], { slow: true });
     assert.equal(r.streamed, "back");
     assert.equal(requests.length, 3);
     assert.equal(r.retries.length, 2);
@@ -91,7 +91,7 @@ test("transient HTTP errors are retried with backoff until the service recovers"
 
 test("Retry-After on 429 is honoured", async () => {
   await withFetch([status(429, { "retry-after": "1" }), text("ok")], async () => {
-    const r = await run([{ role: "user", content: "q" }]);
+    const r = await run([{ role: "user", content: "q" }], { slow: true });
     assert.equal(r.retries[0].delayMs, 1000);
     assert.equal(r.streamed, "ok");
   });
@@ -109,7 +109,7 @@ test("permanent errors are not retried", async () => {
 test("stopping during a backoff wait aborts promptly", async () => {
   await withFetch([status(503), status(503), status(503)], async () => {
     const ctrl = new AbortController();
-    const p = run([{ role: "user", content: "q" }], { signal: ctrl.signal }, { onRetry: () => setTimeout(() => ctrl.abort(), 20) });
+    const p = run([{ role: "user", content: "q" }], { signal: ctrl.signal, slow: true }, { onRetry: () => setTimeout(() => ctrl.abort(), 20) });
     const t0 = Date.now();
     await assert.rejects(p, AbortedError);
     assert.ok(Date.now() - t0 < 900, "did not sit out the full backoff");
@@ -282,11 +282,12 @@ test("a tool that throws is reported to the model instead of ending the turn", a
 });
 
 test("endless cut-off replies end the turn with a reason instead of looping", async () => {
-  const script = Array.from({ length: 12 }, (_, i) => stream([delta({ content: `part ${i} ` })], "close"));
+  const script = Array.from({ length: 14 }, (_, i) => stream([delta({ content: `part ${i} ` })], "close"));
   await withFetch(script, async (requests) => {
     const r = await run([{ role: "user", content: "q" }]);
     assert.equal(r.end, "gave-up");
-    assert.equal(requests.length, 11);
+    assert.equal(requests.length, 13, "12 resumes (with backoff), then a visible stop");
+    assert.ok(r.retries.length >= 10, "repeated interruptions back off");
   });
 });
 
@@ -298,5 +299,110 @@ test("visible reasoning counts as output: a drop after it resumes instead of re-
     assert.equal(r.streamed, "answer");
     assert.equal(r.retries.length, 1, "no text yet, so the empty close is waited out like an outage");
     assert.equal(requests.length, 2);
+  });
+});
+
+const INTERRUPTED = "The model stream was interrupted. Retry to continue.";
+
+test("a server-reported stream interruption before any output is retried, not fatal", async () => {
+  await withFetch([stream([sse({ error: { message: INTERRUPTED } })], "close"), text("recovered")], async (requests) => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "recovered");
+    assert.equal(requests.length, 2);
+    assert.equal(r.retries.length, 1);
+  });
+});
+
+test("a server-reported interruption mid-reply resumes from the partial text", async () => {
+  await withFetch([stream([delta({ content: "First half, " }), sse({ error: { message: INTERRUPTED } })], "close"), text("second half.")], async (requests) => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "First half, second half.");
+    assert.match(requests[1].messages.at(-1).content, /cut off/);
+    assert.deepEqual(requests[1].messages.at(-2), { role: "assistant", content: "First half, " });
+  });
+});
+
+test("interruptions reported as a JSON error body or finish_reason=error are retried too", async () => {
+  await withFetch([() => Response.json({ error: { message: INTERRUPTED } }), text("ok after json error")], async () => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "ok after json error");
+  });
+  await withFetch([stream([delta({}, "error")], "close"), text("ok after finish error")], async () => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "ok after finish error");
+  });
+});
+
+test("an interrupted subagent retries and completes instead of failing", async () => {
+  const { runSubagent } = await import("../dist/agents.js");
+  await withFetch([stream([sse({ error: { message: INTERRUPTED } })], "close"), stream([delta({ content: "Half a rep" }), sse({ error: INTERRUPTED })], "close"), text("ort.")], async (requests) => {
+    const res = await runSubagent({ baseUrl: "http://local.test/v1", key: "k", model: "m", systemPrompt: "sys", prompt: "count things", tools: [], signal: new AbortController().signal, execute: async () => ({ ok: true, output: "" }), backoff: () => 5 });
+    assert.equal(res.text, "Half a report.");
+    assert.equal(requests.length, 3);
+  });
+});
+
+test("server-reported errors are classified: transient ones retry, real failures stop", async () => {
+  const { serverReportedError } = await import("../dist/api.js");
+  for (const e of [INTERRUPTED, "Upstream timed out", "The model is overloaded", "Service temporarily unavailable", { message: "x", code: 503 }, { message: "boom", type: "server_error" }, { message: "Internal server error" }, "Rate limit reached, try again in 2s"]) {
+    assert.equal(serverReportedError(e).permanent, false, JSON.stringify(e));
+  }
+  for (const e of ["This model's maximum context length is 128000 tokens", "Invalid request: messages must be an array", "Insufficient credit", { message: "nope", code: 400 }, "Request blocked by content policy", "Something odd happened"]) {
+    assert.equal(serverReportedError(e).permanent, true, JSON.stringify(e));
+  }
+  assert.match(serverReportedError({ message: INTERRUPTED }).message, /interrupted/);
+});
+
+test("a reasoning-only stream past the deadline is asked to act instead of ending the turn", async () => {
+  const thinking = () => new Response(new ReadableStream({ start(c) { const t = setInterval(() => { try { c.enqueue(delta({ reasoning_content: "hmm " })); } catch { clearInterval(t); } }, 5); } }), { headers: { "content-type": "text/event-stream" } });
+  await withFetch([thinking, text("Acting now.")], async (requests) => {
+    const r = await run([{ role: "user", content: "fix it" }], { reasoningTimeoutMs: 60 });
+    assert.equal(r.end, "done");
+    assert.match(r.streamed, /Acting now/);
+    assert.match(requests[1].messages.at(-1).content, /Skip further deliberation/);
+  });
+});
+
+test("glitches that may repeat (malformed chunks) are retried a bounded number of times", async () => {
+  const torn = () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("data: {not json\n\n")); c.close(); } }), { headers: { "content-type": "text/event-stream" } });
+  await withFetch([torn, text("clean")], async () => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "clean");
+  });
+  await withFetch([torn, torn, torn, torn, torn], async (requests) => {
+    await assert.rejects(run([{ role: "user", content: "q" }]), /malformed/);
+    assert.equal(requests.length, 4, "1 try + 3 retries");
+  });
+});
+
+test("a 4xx whose message asks for a retry is retried; ordinary 4xx are not", async () => {
+  const bad = (message) => () => Response.json({ error: { message } }, { status: 400 });
+  await withFetch([bad(INTERRUPTED), text("ok")], async () => {
+    const r = await run([{ role: "user", content: "q" }]);
+    assert.equal(r.streamed, "ok");
+  });
+  await withFetch([bad("messages: field required")], async (requests) => {
+    await assert.rejects(run([{ role: "user", content: "q" }]), /field required/);
+    assert.equal(requests.length, 1);
+  });
+});
+
+test("a message sent mid-batch is delivered after the running tool; the rest of the batch is skipped", async () => {
+  const ran = [];
+  const pending = [];
+  const tools = [{ type: "function", function: { name: "edit_file", description: "", parameters: {} } }];
+  const skipped = [];
+  await withFetch([toolCall([{ id: "e1", name: "edit_file", args: "{}" }, { id: "e2", name: "edit_file", args: "{}" }, { id: "e3", name: "edit_file", args: "{}" }]), text("re-planned")], async (requests) => {
+    await run([{ role: "user", content: "fix it" }], {
+      tools,
+      execute: async (_n, _a, id) => { ran.push(id); if (id === "e1") pending.push("stop, use tabs instead"); return { ok: true, output: "edited" }; },
+      interject: () => pending.splice(0),
+    }, { onToolResult: (_n, ok, out, id) => { if (!ok) skipped.push(id); } });
+    assert.deepEqual(ran, ["e1"], "only the running tool finished");
+    assert.deepEqual(skipped, ["e2", "e3"]);
+    const msgs = requests[1].messages;
+    assert.deepEqual(msgs.filter((m) => m.role === "tool").map((m) => m.tool_call_id), ["e1", "e2", "e3"], "every call still gets a result");
+    assert.match(msgs.find((m) => m.tool_call_id === "e2").content, /Not run: the user sent a new message/);
+    assert.match(msgs.at(-1).content, /stop, use tabs instead/);
   });
 });

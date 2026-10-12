@@ -1,4 +1,4 @@
-import { agentTurn, type AgentHandlers, type AgentMessage, type RetryInfo } from "./api.js";
+import { agentTurn, type AgentHandlers, type AgentMessage, type Backoff, type RetryInfo } from "./api.js";
 import type { ToolDef } from "./tools.js";
 import { WORKFLOW_CONCURRENCY, WORKFLOW_MAX_AGENTS } from "./workflow.js";
 
@@ -81,6 +81,8 @@ export interface SubagentRun {
   describeCall?: (name: string, args: string) => string;
   onActivity?: (a: SubagentActivity) => void;
   onRetry?: (info: RetryInfo) => void;
+  /** Retry pacing (tests use a fast one). */
+  backoff?: Backoff;
 }
 
 export interface SubagentResult {
@@ -129,6 +131,7 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
     effort: run.effort,
     tools: run.tools,
     maxRounds: run.maxRounds ?? 60,
+    backoff: run.backoff,
     execute: run.execute,
   });
   let text = res.text.trim();

@@ -186,3 +186,35 @@ test("text typed while a permission prompt is open becomes a message, never an a
     assert.match(fs.readFileSync(path.join(work, "calc.py"), "utf8"), /a\+b/);
   } finally { ui.unmount(); }
 });
+
+test("'The model stream was interrupted' is recovered everywhere: main agent mid-reply and every subagent", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:flaky please");
+    await waitFor(ui, /Both flaky subagents reported back[\s\S]*Worked for/, "turn completes despite interruptions", 40_000);
+    const out = all(ui);
+    assert.doesNotMatch(out, /Subagent failed/);
+    assert.doesNotMatch(out, /✗ The server reported an error/);
+    assert.match(out, /Starting the work,/, "the partial reply was kept");
+    assert.match(out, /interrupted — resuming where it stopped/, "the resume is visible");
+    assert.equal(out.match(/Done \(1 tool use/g)?.length, 2, "both subagents finished");
+  } finally { ui.unmount(); }
+});
+
+test("a message sent while a batch of tools runs is delivered after the current tool", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:batch go");
+    await waitFor(ui, /Bash\(sleep 1/, "first tool of the batch started");
+    await type(ui, "use the second approach instead");
+    await waitFor(ui, /Delivered to the agent mid-turn/, "delivered after the running tool", 15_000);
+    await waitFor(ui, /Worked for/, "turn end", 15_000);
+    const out = all(ui);
+    assert.match(out, /Not run: the user sent a new message/, "the rest of the planned batch was skipped");
+    assert.match(out, /Re-planned with your message/);
+  } finally { ui.unmount(); }
+});
