@@ -40,7 +40,7 @@ Then type `/login` and paste your API key. You can get a key at [unjailedai.com/
 
 ## Commands
 
-Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, and Esc to close. The menu also works while the agent is running: `/help`, `/verbose`, `/stats`, `/agents`, `/context`, `/workflows`, `/remember`, and status or stop forms of `/goal` and `/loop` run at once; other commands are marked and run when the turn ends.
+Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, and Esc to close. The menu also works while the agent is running, and commands run at once: `/tools`, `/auto` and `/bypass` apply to the agent's next action; `/model`, `/effort`, `/skills` and `/plan` apply from the next request. Only commands that would disrupt the running turn (`/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update`, and running a `/workflow`) are marked and wait for it to end.
 
 | Command | What it does |
 |---|---|

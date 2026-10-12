@@ -152,12 +152,12 @@ test("commands queued during a turn don't strand the messages queued after them"
     await sleep(150);
     await type(ui, "markdown please");
     await sleep(100);
-    await type(ui, "/effort low");
+    await type(ui, "/logout");
     await type(ui, "second message");
     await waitFor(ui, /Queued — runs when this turn ends[\s\S]*Queued — runs when this turn ends/, "both queued");
-    await waitFor(ui, /Effort set to low/, "queued command ran", 30_000);
+    await waitFor(ui, /still logged in through the UNJAILED_API_KEY/, "queued command ran", 30_000);
     await waitFor(ui, /You said: "second message"[\s\S]*Worked for/, "the message behind it ran too", 30_000);
-  } finally { ui.unmount(); writeConfig({ effort: "auto" }); }
+  } finally { ui.unmount(); }
 });
 
 test("text typed while a permission prompt is open becomes a message, never an answer", async () => {
@@ -263,7 +263,7 @@ test("/verbose shows live stats during a turn; /stats reports the turn and the s
   } finally { ui.unmount(); writeConfig({ verbose: false }); }
 });
 
-test("the slash menu works while the agent runs; info commands run at once, others wait for the turn", async () => {
+test("the slash menu works while the agent runs; commands run at once unless they would disrupt the turn", async () => {
   writeConfig({ tools: "yolo", plan: false, fx: false, verbose: false });
   const ui = render(React.createElement(App));
   try {
@@ -273,15 +273,36 @@ test("the slash menu works while the agent runs; info commands run at once, othe
     ui.stdin.write("/");
     await sleep(120);
     const menu = ui.lastFrame();
-    assert.match(menu, /\/login\s+Log in with your API key/, "commands and descriptions are listed mid-turn");
-    assert.match(menu, /runs when this turn ends/, "commands that wait are marked");
+    assert.match(menu, /\/model \[id\]\s+Choose a model/, "commands and descriptions are listed mid-turn");
+    assert.match(menu, /\/login\s+Log in with your API key · runs when this turn ends/, "disruptive commands are marked");
+    assert.doesNotMatch(menu, /\/model \[id\][^\n]*runs when this turn ends/, "the rest are not");
     ui.stdin.write("\x1b"); await sleep(120);
     assert.doesNotMatch(ui.lastFrame(), /Press Esc again to stop/, "Esc closed the menu without arming stop");
     await type(ui, "/stats");
     await waitFor(ui, /Stats · session/, "/stats ran immediately");
-    assert.doesNotMatch(all(ui), /Worked for/, "…while the turn was still running");
     await type(ui, "/effort low");
-    await waitFor(ui, /Queued — runs when this turn ends · \/effort low/, "other commands wait");
-    await waitFor(ui, /Worked for[\s\S]*Effort set to low/, "and run after the turn", 15_000);
+    await waitFor(ui, /Effort set to low\. Applies from the next turn\./, "settings change at once and say when they apply");
+    assert.doesNotMatch(all(ui), /Worked for/, "…all while the turn was still running");
+    await type(ui, "/resume");
+    await waitFor(ui, /Queued — runs when this turn ends · \/resume/, "disruptive commands wait");
+    await waitFor(ui, /Worked for[\s\S]*(Resume a chat|No saved chats|Saved chats)/, "and run after the turn", 15_000);
   } finally { ui.unmount(); writeConfig({ effort: "auto" }); }
+});
+
+test("/auto typed mid-run stops the permission prompts for the rest of the running turn", async () => {
+  writeConfig({ tools: "cmds", plan: false, autoMode: "ask", fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:batch three steps");
+    await waitFor(ui, /Permission needed[\s\S]*Bash\(sleep 1/, "first approval");
+    await sleep(200);
+    // Typed into the approval card: becomes a message, sent with Enter, and runs at once.
+    ui.stdin.write("/auto"); await sleep(80); ui.stdin.write("\r");
+    await waitFor(ui, /\/auto on — the agent makes changes and runs commands without asking/, "auto on mid-run");
+    await sleep(100);
+    ui.stdin.write("y");
+    // The remaining two commands must run without another prompt.
+    await waitFor(ui, /Bash\(echo three\)\n\s+⎿\s+three[\s\S]*Worked for/, "rest of the batch ran unattended", 15_000);
+  } finally { ui.unmount(); writeConfig({ autoMode: "ask", tools: "yolo" }); }
 });

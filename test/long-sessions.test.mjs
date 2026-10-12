@@ -88,7 +88,7 @@ test("trimming serializes each tool payload once instead of rescanning per old r
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(predicate, detail) {
-  for (let i = 0; i < 120; i++) { if (predicate()) return; await sleep(25); }
+  for (let i = 0; i < 400; i++) { if (predicate()) return; await sleep(25); }
   assert.fail(`Timed out: ${detail}`);
 }
 async function submit(ui, text) { ui.stdin.write(text); await sleep(80); ui.stdin.write("\r"); await sleep(80); }

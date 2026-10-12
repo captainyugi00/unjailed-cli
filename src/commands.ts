@@ -33,18 +33,20 @@ export const COMMANDS: CommandSpec[] = [
   { name: "exit", description: "Quit Unjailed" },
 ];
 
-/** Commands that only show something or change a harmless setting run at
- *  once, even while the agent is working; everything else waits for the
- *  turn to end. Stopping a goal or loop is immediate on purpose. */
-const MID_TURN = new Set(["help", "verbose", "stats", "agents", "context", "workflows", "remember"]);
+/** Commands that would disrupt a running turn (they replace the chat, the
+ *  login, or the process, or start a turn of their own) wait for it to end.
+ *  Everything else works at once, even while the agent is running. */
+const WAITS_FOR_TURN = new Set(["clear", "resume", "sessions", "login", "logout", "update"]);
 
-export function runsMidTurn(name: string, arg = ""): boolean {
-  const a = arg.trim().toLowerCase();
-  if (MID_TURN.has(name)) return true;
-  if (name === "goal") return a === "" || ["clear", "off", "stop", "cancel"].includes(a);
-  if (name === "loop") return a === "" || ["stop", "off", "cancel", "clear"].includes(a);
+export function waitsForTurn(name: string, arg = ""): boolean {
+  if (WAITS_FOR_TURN.has(name)) return true;
+  // Running a saved workflow is a turn of its own; creating or listing one is not.
+  if (name === "workflow") return !!arg.trim() && !/^new\s/i.test(arg.trim());
   return false;
 }
+
+/** @deprecated use waitsForTurn */
+export const runsMidTurn = (name: string, arg = "") => !waitsForTurn(name, arg);
 
 /** Commands matching what's typed after "/", prefix matches first. */
 export function filterCommands(query: string): CommandSpec[] {

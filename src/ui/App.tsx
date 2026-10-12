@@ -12,7 +12,7 @@ import {
   type ChatMessage,
   type RetryInfo,
 } from "../api.js";
-import { COMMANDS, filterCommands, parseCommand, runsMidTurn } from "../commands.js";
+import { COMMANDS, filterCommands, parseCommand, waitsForTurn } from "../commands.js";
 import { configPath, deleteKey, EFFORTS, maskKey, readConfig, resolveBaseUrl, resolveKey, writeConfig, type Effort, type KeySource } from "../config.js";
 import { executeTool, toolDefinitions, type ToolDef } from "../tools.js";
 import { approvalAnswer } from "./approval.js";
@@ -171,6 +171,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   });
   /** Plan mode: model writes a plan first, user approves, then it executes */
   const [planMode, setPlanMode] = useState<"off" | "on">(() => (readConfig().plan === false ? "off" : "on"));
+  // Read by the running turn, so /tools and /auto take effect on its next action.
+  const permissions = useRef({ toolsMode, autoMode });
+  permissions.current = { toolsMode, autoMode };
   // Skills switched on for this chat (by name). Their files are re-read on every request.
   const [activeSkills, setActiveSkills] = useState<string[]>([]);
 
@@ -594,7 +597,6 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     let endNote = "";
     let errMsg = "";
     const useTools = toolsMode !== "off";
-    const yolo = toolsMode === "yolo" || autoMode === "auto";
 
     const handlers: AgentHandlers = {
       onRequest: (context) => {
@@ -703,9 +705,12 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
     /** Run one tool on behalf of the main agent or a subagent. */
     const runTool = async (name: string, args: Record<string, unknown>, agentLabel?: string): Promise<{ ok: boolean; output: string }> => {
+      // Current permissions, not the ones the turn started with: /tools off
+      // blocks the next change at once; /auto stops the next prompt.
+      const now = permissions.current;
       const result = await executeTool(name, args, process.cwd(), () => askApproval(name, args, agentLabel), {
-        mode: toolsMode,
-        autoApprove: yolo || alwaysAllow.current.has(name),
+        mode: now.toolsMode,
+        autoApprove: now.toolsMode === "yolo" || now.autoMode === "auto" || alwaysAllow.current.has(name),
         signal: ctrl.signal,
       });
       return result;
@@ -817,7 +822,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         script = saved.script;
       }
       if (!script.trim()) return { ok: false, output: "Pass a workflow `script` or a saved workflow `name`." };
-      if (!yolo && !alwaysAllow.current.has("workflow") && !(await askApproval("workflow", { ...args, script }))) {
+      const auto = permissions.current.toolsMode === "yolo" || permissions.current.autoMode === "auto";
+      if (!auto && !alwaysAllow.current.has("workflow") && !(await askApproval("workflow", { ...args, script }))) {
         return { ok: false, output: "The user declined the workflow. Nothing ran." };
       }
       return orchestrate(script, args.args, ctrl.signal);
@@ -1333,7 +1339,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const setAndSaveEffort = (next: Effort) => {
     setEffort(next);
     writeConfig({ effort: next });
-    success(next === "auto" ? "Effort set to auto — the model decides how long to think." : `Effort set to ${next}.`);
+    success((next === "auto" ? "Effort set to auto — the model decides how long to think." : `Effort set to ${next}.`) + (runningTurn.current ? " Applies from the next turn." : ""));
   };
 
   const effortCommand = (arg: string) => {
@@ -1789,15 +1795,28 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     else error("The update didn't finish cleanly. Run: npm install -g unjailed@latest");
   };
 
+  /** A short request of its own (/api, /model). During a turn it gets a
+   *  separate handle, so it can't replace or clear the turn's stop. */
+  const sideRequest = () => {
+    const ctrl = new AbortController();
+    const owns = !runningTurn.current;
+    if (owns) abortRef.current = ctrl;
+    return {
+      ctrl,
+      busy: (label: string | null) => { if (owns) setBusy(label); },
+      done: () => { if (abortRef.current === ctrl) abortRef.current = null; if (owns) setBusy(null); },
+    };
+  };
+
   const apiInfo = async () => {
     push({ kind: "plain", text: apiLines(auth.key, auth.source, model) });
     if (!auth.key) {
       error(`Connection not checked. ${NOT_LOGGED_IN}`);
       return;
     }
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    setBusy("Checking connection");
+    const side = sideRequest();
+    const ctrl = side.ctrl;
+    side.busy("Checking connection");
     const t0 = Date.now();
     try {
       const models = await listModels(baseUrl, auth.key, ctrl.signal);
@@ -1809,15 +1828,14 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     } catch (err) {
       if (!ctrl.signal.aborted) error(`Connection failed: ${friendly(err)}`);
     } finally {
-      abortRef.current = null;
-      setBusy(null);
+      side.done();
     }
   };
 
   const setAndSaveModel = (next: string) => {
     setModel(next);
     writeConfig({ model: next });
-    success(`Model set to ${next}${messages.current.length ? " · conversation kept" : ""}`);
+    success(`Model set to ${next}${messages.current.length ? " · conversation kept" : ""}${runningTurn.current ? " · applies from the next turn" : ""}`);
   };
 
   const chooseModel = async (arg: string) => {
@@ -1826,9 +1844,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       return;
     }
     if (!arg) setMode({ type: "picker", models: null, selected: 0 });
-    const ctrl = new AbortController();
-    abortRef.current = ctrl;
-    if (arg) setBusy("Checking model");
+    const side = sideRequest();
+    const ctrl = side.ctrl;
+    if (arg) side.busy("Checking model");
     try {
       const ids = (await listModels(baseUrl, auth.key, ctrl.signal)).map((m) => m.id);
       if (ctrl.signal.aborted) return;
@@ -1850,8 +1868,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       setMode({ type: "chat" });
       error(`Couldn't load models: ${friendly(err)}`);
     } finally {
-      abortRef.current = null;
-      setBusy(null);
+      side.done();
     }
   };
 
@@ -1917,7 +1934,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     // step; commands and plain-chat messages run when the turn finishes.
     // Informational and stop commands run at once even mid-turn.
     const cmd = text.startsWith("/") ? parseCommand(text) : null;
-    if (cmd && (turnActive || busy) && runsMidTurn(cmd.name, cmd.arg)) {
+    if (cmd && (turnActive || busy) && !waitsForTurn(cmd.name, cmd.arg)) {
       void runCommand(text);
       return;
     }
@@ -2059,7 +2076,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       return;
     }
     // With the slash menu open, Esc only closes the menu.
-    if (key.escape && abortRef.current && (turnActive || busy) && !menuOpen) {
+    if (key.escape && abortRef.current && (turnActive || busy) && !menuOpen && (mode.type === "chat" || mode.type === "login")) {
       // Two-stage: first Esc arms, second Esc actually stops the running turn
       // (and the queue drains the next one). A stray Esc can't kill a long run.
       if (escArmed.current) {
@@ -2402,7 +2419,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         <Box flexDirection="column" marginLeft={1}>
           {slashMatches.length ? (
             <SelectList
-              items={slashMatches.map((c) => ({ key: c.name, label: `/${c.name}${c.args ? " " + c.args : ""}`, hint: c.description + (turnActive && !runsMidTurn(c.name) ? theme.dim(" · runs when this turn ends") : "") }))}
+              items={slashMatches.map((c) => ({ key: c.name, label: `/${c.name}${c.args ? " " + c.args : ""}`, hint: c.description + (turnActive && waitsForTurn(c.name, c.args?.startsWith("<") ? "x" : "") ? theme.dim(" · runs when this turn ends") : "") }))}
               selected={slashSel}
               max={8}
             />
