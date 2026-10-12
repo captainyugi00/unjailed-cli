@@ -113,6 +113,18 @@ export function clipAnsi(text: string, max: number): string {
 }
 
 /** "Update(src/calc.py)" — the bold label plus a clipped subject. */
+export type ToolKind = "read" | "edit" | "shell" | "web" | "agent" | "other";
+
+/** What kind of work a tool does (stats and colors). */
+export function toolKind(name: string): ToolKind {
+  if (["read_file", "list_dir", "glob", "grep", "search_history", "process_status", "clipboard"].includes(name)) return "read";
+  if (["write_file", "edit_file", "move_file", "delete_file"].includes(name)) return "edit";
+  if (["run_command", "stop_process", "launch_app"].includes(name)) return "shell";
+  if (["web_fetch", "open_url"].includes(name)) return "web";
+  if (["agent", "workflow", "schedule_next"].includes(name)) return "agent";
+  return "other";
+}
+
 /** The color family of a tool: reading, editing, shell, web or agents. */
 export function toolTone(name: string): (s: string) => string {
   if (["read_file", "list_dir", "glob", "grep", "search_history", "process_status", "clipboard"].includes(name)) return tone.read;

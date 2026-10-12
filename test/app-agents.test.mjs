@@ -248,3 +248,17 @@ test("/verbose shows the model's thinking, subagent steps and full tool output; 
     assert.equal(readConfig().verbose, false);
   } finally { ui.unmount(); writeConfig({ verbose: false }); }
 });
+
+test("/verbose shows live stats during a turn; /stats reports the turn and the session", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false, verbose: true });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:agents counting");
+    await waitFor(ui, /▸ Requests \d+[\s\S]*Tokens ↑[\s\S]*Tools \d+[\s\S]*Session/, "live stats panel");
+    await waitFor(ui, /Worked for/, "turn end");
+    await type(ui, "/stats");
+    await waitFor(ui, /Stats · last turn and session[\s\S]*Requests \d+[\s\S]*Tools 4 \(read 2, agent 2\)[\s\S]*Agents 2 · 2 done[\s\S]*Session 1 turn/, "/stats output");
+    await waitFor(ui, /Σ ↑[\d.]+k? ↓\d+/, "session totals in the footer");
+  } finally { ui.unmount(); writeConfig({ verbose: false }); }
+});

@@ -145,3 +145,24 @@ test("verbose tool summaries show up to 40 lines of output", () => {
   assert.deepEqual(toolSummary("read_file", {}, true, "a\nb", 100, true), ["Read 2 lines", "a", "b"]);
   assert.deepEqual(toolSummary("grep", {}, true, "(no matches)", 100, true), ["No matches"]);
 });
+
+test("verbose stats lines cover requests, latency, speed, tokens, tools, agents and the session", async () => {
+  const { statsLines, addTurnToSession, emptySessionStats } = await import("../dist/ui/ActivityBar.js");
+  const main = { id: "main", label: "main agent", main: true, status: "running", startedAt: 0, tokensIn: 12_000, tokens: 2_000, reasoning: 500 };
+  const sub = { id: "a", label: "Review", status: "done", startedAt: 0, endedAt: 9_000, tokensIn: 6_000, tokens: 1_000, reasoning: 300, requests: 3, retries: 1 };
+  const view = {
+    activity: { phase: "tool", startedAt: 0, tokens: 3_000 },
+    main, groups: [], all: [main, sub],
+    stats: { requests: 5, retries: 2, recoveries: 1, ttftLastMs: 1_200, ttftTotalMs: 4_000, ttftCount: 2, firstOutputAt: 10_000, contextTokens: 12_400, tools: { read: 4, edit: 3, shell: 2, agent: 1 } },
+  };
+  const session = { ...emptySessionStats(), turns: 2, workMs: 60_000, tokensIn: 100_000, tokens: 9_000, tools: 20, requests: 15 };
+  const lines = statsLines(view, session, 40_000, 200);
+  assert.equal(lines[0], "Requests 8 (3 retried) · first token 1.2s (avg 2.0s) · speed 100 tok/s · context 12.4k");
+  assert.equal(lines[1], "Tokens ↑ 18k in · ↓ 3k out · ∴ 800 thinking · Σ 21k");
+  assert.equal(lines[2], "Tools 10 (read 4, edit 3, shell 2, agent 1) · Agents 1 · 1 done · recoveries 1");
+  assert.equal(lines[3], "Session 3 turns · 1m 40s · ↑ 118k · ↓ 12k · ∴ 800 · 30 tools · 23 requests · 3 retried", "live: includes this turn");
+  assert.match(statsLines(view, session, 40_000, 200, false)[3], /^Session 2 turns/);
+  for (const w of [30, 60]) for (const l of statsLines(view, session, 40_000, w)) assert.ok(stringWidth(l) <= w, `${w}: ${l}`);
+  const next = addTurnToSession(session, view, 30_000);
+  assert.deepEqual([next.turns, next.requests, next.retries, next.tools, next.agents], [3, 23, 3, 30, 1]);
+});

@@ -31,8 +31,8 @@ import { SelectList } from "./SelectList.js";
 import { Spinner } from "./Spinner.js";
 import { useTerminalSize } from "./useTerminalSize.js";
 import { StreamDisplayBuffer, retainDisplayWindow, streamingRowBudget } from "./stream-buffer.js";
-import { ActivityBar, agentsTable, formatElapsed, formatTokens, type AgentStat, type LiveView, type Phase, type Task, type TaskGroup } from "./ActivityBar.js";
-import { clip, describeAction, formatToolBlock, parseArgs, toolSummary, toolTitle } from "./tool-format.js";
+import { ActivityBar, addTurnToSession, agentsTable, emptySessionStats, emptyTurnStats, formatElapsed, formatTokens, statsLines, type AgentStat, type LiveView, type Phase, type SessionStats, type Task, type TaskGroup } from "./ActivityBar.js";
+import { clip, describeAction, formatToolBlock, parseArgs, toolKind, toolSummary, toolTitle } from "./tool-format.js";
 import { sanitizeForDisplay } from "./sanitize.js";
 import { Thinking } from "./Thinking.js";
 import {
@@ -48,6 +48,9 @@ import {
   sessionsEnabled,
   timeAgo,
   titleFrom,
+  MAX_PENDING_CHARS,
+  MAX_SAVED_INPUTS,
+  type PendingTurn,
   type Session,
   type SessionMeta,
 } from "../sessions.js";
@@ -131,6 +134,12 @@ function friendly(err: unknown): string {
   return "Something went wrong. Try again.";
 }
 
+/** Autosave interval (UNJAILED_AUTOSAVE_SECONDS, default 10). */
+const AUTOSAVE_MS = (() => {
+  const seconds = Number(process.env.UNJAILED_AUTOSAVE_SECONDS);
+  return (Number.isFinite(seconds) && seconds >= 1 ? seconds : 10) * 1000;
+})();
+
 /** A new live view: the turn's activity plus the main agent's own stats row. */
 function freshLive(phase: Phase, startedAt = Date.now()): LiveView {
   return {
@@ -172,7 +181,23 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const [mode, setMode] = useState<Mode>({ type: "chat" });
   const [editor, setEditor] = useState<EditorState>(EMPTY);
   const [slashSel, setSlashSel] = useState(0);
-  const [history, setHistory] = useState<string[]>([]);
+  // ↑ history survives restarts: seeded from the latest chat in this folder.
+  const [history, setHistoryState] = useState<string[]>(() => {
+    if (!sessionsEnabled()) return [];
+    try {
+      return listSessions().find((x) => x.cwd === process.cwd())?.inputs ?? [];
+    } catch {
+      return [];
+    }
+  });
+  const historyRef = useRef(history);
+  const setHistory = (update: (h: string[]) => string[]) => {
+    setHistoryState((h) => {
+      const next = update(h).slice(-MAX_SAVED_INPUTS);
+      historyRef.current = next;
+      return next;
+    });
+  };
   const [histIdx, setHistIdx] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -217,6 +242,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const live = useRef<LiveView>(freshLive("waiting"));
   /** Every agent of the latest turn, for /agents after it ends. */
   const lastAgents = useRef<AgentStat[]>([]);
+  /** Stats: the latest turn's live view, and running session totals. */
+  const lastView = useRef<LiveView | null>(null);
+  const sessionStats = useRef<SessionStats>(emptySessionStats());
   /** Ctrl+T: the detailed agents table instead of the compact panel. */
   const [agentsExpanded, setAgentsExpanded] = useState(false);
   const goalRef = useRef<Goal | null>(null);
@@ -457,10 +485,33 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     const started = Date.now();
+    // Save the prompt right away and after each tool; the autosave timer
+    // keeps the partial reply current in between (see AUTOSAVE_MS).
+    const pendingNow = (): PendingTurn => ({ startedAt: started, partial: full });
+    pendingRef.current = pendingNow;
+    const saveProgress = (_force = true) => void persist(pendingNow());
     live.current = freshLive("waiting", started);
     const main = live.current.main;
     const turnAgents: AgentStat[] = [main];
     live.current.all = turnAgents;
+    const stats = emptyTurnStats();
+    live.current.stats = stats;
+    let requestStartedAt = 0;
+    let awaitingFirstOutput = false;
+    /** Time to first token, per request, for the verbose stats. */
+    const markOutput = () => {
+      const now = Date.now();
+      stats.firstOutputAt ??= now;
+      if (!awaitingFirstOutput) return;
+      awaitingFirstOutput = false;
+      stats.ttftLastMs = now - requestStartedAt;
+      stats.ttftTotalMs += stats.ttftLastMs;
+      stats.ttftCount++;
+    };
+    const countTool = (name: string) => {
+      const kind = toolKind(name);
+      stats.tools[kind] = (stats.tools[kind] ?? 0) + 1;
+    };
 
     let full = ""; // assistant prose this turn, for the saved transcript
     let displayBuffer = new StreamDisplayBuffer();
@@ -538,6 +589,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     };
 
     setStream({ text: "", hiddenCharacters: 0, flushed: false });
+    saveProgress(true);
     let outcome: "done" | "stopped" | "error" = "done";
     let endNote = "";
     let errMsg = "";
@@ -547,6 +599,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const handlers: AgentHandlers = {
       onRequest: (context) => {
         requestContextChars = context.characters;
+        stats.requests++;
+        requestStartedAt = Date.now();
+        awaitingFirstOutput = true;
         if (!retrying) setPhase("waiting");
       },
       onContextTrim: () => {
@@ -555,6 +610,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         info("Older request context compacted with exact excerpts; full history stays available. Pin key instructions with /remember. Agent tools can recover older text with search_history.");
       },
       onToken: (t) => {
+        markOutput();
         clearRetry();
         endThinking();
         setPhase("writing");
@@ -565,6 +621,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         schedule();
       },
       onReasoning: (t) => {
+        markOutput();
         clearRetry();
         if (!thinkingSince) thinkingSince = Date.now();
         setPhase("thinking", sanitizeForDisplay(t).replace(/\s+/g, " ").trim().slice(-60) || live.current.activity.detail);
@@ -578,6 +635,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       },
       onUsage: (u) => {
         gotUsage = true;
+        stats.contextTokens = u.prompt;
         completionTokens += u.completion;
         main.tokensIn = (main.tokensIn ?? 0) + u.prompt;
         // The server's reasoning count wins over the estimate from streamed thinking.
@@ -590,12 +648,14 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         setUsage({ ctx: u.prompt, prompt: u.prompt, completion: u.completion, approx: false });
       },
       onNotice: (note) => {
+        stats.recoveries++;
         // Print what streamed so far first, so the note sits after the text it is about.
         flushAll();
         if (full && !full.endsWith("\n\n")) full += "\n\n";
         warn(note);
       },
       onRetry: (r: RetryInfo) => {
+        stats.retries++;
         const reason = r.reason.replace(/[.\s]+$/, "");
         if (!retrying) warn(`${reason} — retrying automatically until the service responds. Esc Esc to stop.`);
         retrying = true;
@@ -607,6 +667,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         clearRetry();
         endThinking();
         main.toolUses = (main.toolUses ?? 0) + 1;
+        countTool(name);
         flushAll();
         if (full && !full.endsWith("\n\n")) full += "\n\n";
         setPhase(name === "agent" || name === "workflow" ? "subagents" : "tool", toolTitle(name, parseArgs(args), 60).replace(/\x1b\[[0-9;]*m/g, ""));
@@ -666,13 +727,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           signal,
           execute: async (name, args) => {
             const r = await runTool(name, args, task.label);
-            const event = { id: randomUUID(), name, args, ok: r.ok, output: r.output, at: Date.now() };
+            const event: ToolEvent = { id: randomUUID(), name, args, ok: r.ok, output: r.output, at: Date.now(), turn: messages.current.length };
             toolHistory.current.push(event);
             turnEvents.push(event);
+            saveProgress(true);
             return r;
           },
           describeCall: (name, args) => toolTitle(name, parseArgs(args), 50).replace(/\x1b\[[0-9;]*m/g, ""),
           onTool: (name, args) => {
+            countTool(name);
             if (verboseRef.current) push({ kind: "info", text: `↳ ${task.label}: ${toolTitle(name, parseArgs(args), Math.max(30, size.columns - task.label.length - 10))}` });
           },
           onActivity: (a) => {
@@ -683,6 +746,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             task.tokens = a.tokens;
             task.reasoning = a.reasoning;
             task.toolUses = a.toolCalls;
+            task.requests = a.requests;
+            task.retries = a.retries;
             refreshTokens();
           },
         });
@@ -733,10 +798,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         const agents = /with (\d+) agent/.exec(result.output)?.[1];
         if (agents) callNotes.set(callId, `${agents} agent${agents === "1" ? "" : "s"} · ${formatElapsed(Date.now() - t0)}`);
       } else result = await runTool(name, args);
-      const event = { id: randomUUID(), name, args, ok: result.ok, output: result.output, at: Date.now() };
+      const event: ToolEvent = { id: randomUUID(), name, args, ok: result.ok, output: result.output, at: Date.now(), turn: messages.current.length };
       if (name !== "search_history" && name !== "schedule_next") {
         toolHistory.current.push(event);
         turnEvents.push(event);
+        saveProgress(true);
       }
       return { ...result, historyEntry: `tool:${event.id}` };
     };
@@ -800,9 +866,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         // itself; its agents still ask before each change in cmds mode.
         setPhase("subagents", `Workflow ${direct.name}`);
         const r = await orchestrate(direct.script, direct.args, ctrl.signal);
-        const event = { id: randomUUID(), name: "workflow", args: { name: direct.name, args: direct.args }, ok: r.ok, output: r.output, at: Date.now() };
+        const event: ToolEvent = { id: randomUUID(), name: "workflow", args: { name: direct.name, args: direct.args }, ok: r.ok, output: r.output, at: Date.now(), turn: messages.current.length };
         toolHistory.current.push(event);
         turnEvents.push(event);
+        saveProgress(true);
         const agents = /with (\d+) agent/.exec(r.output)?.[1];
         // The result itself follows as the reply, so the block only carries the stats.
         push({ kind: "tool", name: "workflow", args: JSON.stringify({ name: direct.name }), ok: r.ok, output: r.ok ? r.output.split("\n")[0]! : r.output, note: agents ? `${agents} agent${agents === "1" ? "" : "s"} · ${formatElapsed(Date.now() - started)}` : undefined });
@@ -897,8 +964,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     flushAll();
     live.current.activity.retry = undefined;
 
+    // The prompt stays in the history even when no reply arrived: it was
+    // saved when the turn started, and the next turn needs it as context.
     if (full.trim()) messages.current.push({ role: "assistant", content: full.trim() });
-    else if (outcome !== "done" && !delivered && toolHistory.current.length === toolEventsBefore && messages.current.at(-1)?.role === "user") messages.current.pop();
+    pendingRef.current = null;
     // A tool may have changed a file before the model disconnected. Retain
     // that task and its evidence even when no assistant prose arrived.
     await persist();
@@ -913,17 +982,19 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const elapsed = formatElapsed(Date.now() - started);
     const tokens = live.current.activity.tokens;
     const tools = turnEvents.length;
-    const stats = [elapsed, tools ? `${tools} tool call${tools === 1 ? "" : "s"}` : "", tokens ? `↓ ${formatTokens(tokens)} tokens` : ""].filter(Boolean).join(" · ");
-    if (outcome === "stopped") push({ kind: "turn", tone: "warn", text: `Stopped by you after ${stats}` });
-    else if (outcome === "error") push({ kind: "turn", tone: "error", text: `${errMsg}  (${stats})` });
-    else if (endNote) push({ kind: "turn", tone: "warn", text: `${endNote}  (${stats})` });
-    else if (!full.trim() && !tools) push({ kind: "turn", tone: "warn", text: `The model returned no text — it may have hit its output limit mid-reasoning. Try /effort low or another model.  (${stats})` });
-    else push({ kind: "turn", tone: "info", text: `Worked for ${stats}` });
+    const summary = [elapsed, tools ? `${tools} tool call${tools === 1 ? "" : "s"}` : "", tokens ? `↓ ${formatTokens(tokens)} tokens` : ""].filter(Boolean).join(" · ");
+    if (outcome === "stopped") push({ kind: "turn", tone: "warn", text: `Stopped by you after ${summary}` });
+    else if (outcome === "error") push({ kind: "turn", tone: "error", text: `${errMsg}  (${summary})` });
+    else if (endNote) push({ kind: "turn", tone: "warn", text: `${endNote}  (${summary})` });
+    else if (!full.trim() && !tools) push({ kind: "turn", tone: "warn", text: `The model returned no text — it may have hit its output limit mid-reasoning. Try /effort low or another model.  (${summary})` });
+    else push({ kind: "turn", tone: "info", text: `Worked for ${summary}` });
     setStream(null);
     main.status = outcome === "error" ? "failed" : "done";
     main.endedAt = Date.now();
     refreshTokens();
     lastAgents.current = turnAgents.map((t) => ({ ...t }));
+    lastView.current = { ...live.current, all: lastAgents.current, stats: { ...stats, tools: { ...stats.tools } } };
+    sessionStats.current = addTurnToSession(sessionStats.current, lastView.current, Date.now() - started);
     live.current.groups = [];
 
     await afterTurn(outcome, text, turnEvents, scheduleDecision, loopRun);
@@ -1005,13 +1076,36 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
   // ---------- sessions ----------
 
-  /** Save the conversation so /resume can pick it up later. Never throws. */
-  const persist = async () => {
-    if (!sessionsEnabled() || (!messages.current.some((m) => m.role === "assistant") && !toolHistory.current.length && !notes.current.length)) return;
+  /** Save the conversation so /resume can pick it up later. Never throws.
+   *  Called at the start of a turn, after every tool, while a reply streams
+   *  and at the end, so closing the CLI mid-run loses at most a few seconds.
+   *  `pending` is the turn in progress (null when it has finished). */
+  const persist = async (pending: PendingTurn | null = null) => {
+    // Read state through a ref: the autosave timer holds an old copy of this function.
+    const { model, activeSkills } = latestState.current;
+    if (!sessionsEnabled() || (!messages.current.length && !toolHistory.current.length && !notes.current.length)) return;
     try {
-      const s = session.current ?? newSession(process.cwd(), model);
       const first = !session.current;
-      session.current = { ...s, model, skills: activeSkills, title: s.title || titleFrom(messages.current), updated: Date.now(), messages: [...messages.current], toolHistory: [...toolHistory.current], notes: [...notes.current] };
+      if (!session.current) session.current = newSession(process.cwd(), model);
+      const g = goalRef.current ?? pausedGoal.current;
+      const l = loopRef.current;
+      // Update the live object in place: the save queue reads its revision
+      // when each write runs, so back-to-back saves never conflict.
+      Object.assign(session.current, {
+        model,
+        skills: activeSkills,
+        // Name the chat after its first prompt, even if a /remember saved it earlier.
+        title: session.current.title && session.current.title !== "(untitled)" ? session.current.title : titleFrom(messages.current),
+        updated: Date.now(),
+        messages: [...messages.current],
+        toolHistory: [...toolHistory.current],
+        notes: [...notes.current],
+        pending: pending ? { startedAt: pending.startedAt, partial: pending.partial.slice(-MAX_PENDING_CHARS) } : undefined,
+        goal: g ? { condition: g.condition, turns: g.turns, maxTurns: g.maxTurns, startedAt: g.startedAt, lastReason: g.lastReason } : undefined,
+        loop: l ? { prompt: l.prompt, intervalMs: l.intervalMs, iteration: l.iteration } : undefined,
+        inputs: historyRef.current.slice(-MAX_SAVED_INPUTS),
+        stats: { ...sessionStats.current },
+      });
       await appendSession(session.current);
       if (first) pruneSessions();
     } catch (err) {
@@ -1020,11 +1114,43 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     }
   };
   const persistWarned = useRef(false);
+  const latestState = useRef({ model, activeSkills });
+  latestState.current = { model, activeSkills };
 
-  const replayItems = (msgs: ChatMessage[]): NewItem[] =>
-    msgs.flatMap((m): NewItem[] =>
-      m.role === "user" ? [{ kind: "user", text: m.content }] : m.role === "assistant" ? [{ kind: "assistant", text: m.content, first: true }] : [],
-    );
+  /** The turn in progress, for the autosave timer (null between turns). */
+  const pendingRef = useRef<(() => PendingTurn) | null>(null);
+  const lastSaved = useRef("");
+  // Autosave every AUTOSAVE_MS, idle or mid-run, whenever anything changed:
+  // a killed or closed CLI loses at most that much of a streaming reply.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const pending = pendingRef.current?.() ?? null;
+      const g = goalRef.current ?? pausedGoal.current;
+      const signature = [messages.current.length, toolHistory.current.length, notes.current.length, pending ? pending.partial.length : -1, g ? `${g.condition.length}:${g.turns}` : "", loopRef.current?.iteration ?? "", historyRef.current.length, latestState.current.model, latestState.current.activeSkills.join(",")].join("|");
+      if (signature === lastSaved.current) return;
+      lastSaved.current = signature;
+      void persist(pending);
+    }, AUTOSAVE_MS);
+    return () => clearInterval(t);
+    // persist reads refs, so the interval never needs to restart
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /** The transcript of a saved chat: messages, with each tool block placed
+   *  after the message it followed (older saves without positions list
+   *  their messages only). */
+  const replayItems = (msgs: ChatMessage[], events: ToolEvent[]): NewItem[] => {
+    const byTurn = new Map<number, ToolEvent[]>();
+    for (const e of events) if (typeof e.turn === "number") byTurn.set(e.turn, [...(byTurn.get(e.turn) ?? []), e]);
+    const tool = (e: ToolEvent): NewItem => ({ kind: "tool", name: e.name, args: JSON.stringify(e.args), ok: e.ok, output: e.output });
+    const out: NewItem[] = [...(byTurn.get(0) ?? []).map(tool)];
+    msgs.forEach((m, i) => {
+      if (m.role === "user") out.push({ kind: "user", text: m.content });
+      else if (m.role === "assistant") out.push({ kind: "assistant", text: m.content, first: true });
+      out.push(...(byTurn.get(i + 1) ?? []).map(tool));
+    });
+    return out;
+  };
 
   const resumeSession = (meta: SessionMeta) => {
     const s = loadSession(meta.id);
@@ -1039,14 +1165,43 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     messages.current = [...s.messages];
     toolHistory.current = [...(s.toolHistory ?? [])];
     notes.current = [...(s.notes ?? [])];
+    if (s.inputs?.length) setHistory(() => s.inputs!);
+    sessionStats.current = s.stats ? { ...emptySessionStats(), ...s.stats } : emptySessionStats();
+    lastView.current = null;
     const nextModel = s.model || model;
     if (s.model) setModel(s.model);
     setMode({ type: "chat" });
+    alwaysAllow.current.clear();
+    // A goal or loop that was active comes back paused: nothing runs on its own after a restart.
+    setGoal(null);
+    pausedGoal.current = s.goal ? { ...s.goal } : null;
+    setLoop(s.loop ? { ...s.loop, id: ++loopSeq.current, startedAt: Date.now(), nextAt: null, lastReason: "paused" } : null);
+
+    const notesAfter: Item[] = [];
+    const note = (text: string, kind: "info" | "warn" = "info") => notesAfter.push({ id: id(), kind, text });
+    // A turn cut short by closing or killing the CLI: keep what it had written.
+    let interrupted = false;
+    if (s.pending) {
+      interrupted = true;
+      const partial = s.pending.partial.trim();
+      if (partial) messages.current.push({ role: "assistant", content: `${partial}\n\n[This reply was interrupted when the CLI closed.]` });
+    } else if (messages.current.at(-1)?.role === "user") {
+      interrupted = true; // closed before any reply was saved
+    }
     stdout.write("\x1b[2J\x1b[3J\x1b[H");
     const header: Item = { id: id(), kind: "header", model: nextModel, loggedIn: !!auth.key, keySource: auth.source };
-    const intro: Item = { id: id(), kind: "info", text: `Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)} · recent display window; full saved history remains available` };
-    setItems(retainDisplayWindow([header, ...replayItems(s.messages).map((it) => ({ ...it, id: id() }) as Item), intro]));
+    note(`Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${s.toolHistory?.length ?? 0} tool results · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)}`);
+    if (interrupted) note("The last turn was interrupted mid-run. Its messages, tool results and partial reply are restored. Press Enter to continue where it left off.", "warn");
+    if (s.goal) note(`◎ Goal restored (paused): ${clip(s.goal.condition, 120)} — /goal resume to continue it.`);
+    if (s.loop) note(`↻ Loop restored (paused): ${clip(s.loop.prompt, 80)} — /loop resume to restart it, /loop stop to drop it.`);
+    if (notes.current.length) note(`${notes.current.length} pinned note${notes.current.length === 1 ? "" : "s"} restored.`);
+    setItems(retainDisplayWindow([header, ...replayItems(messages.current, toolHistory.current).map((it) => ({ ...it, id: id() }) as Item), ...notesAfter]));
     setStaticKey((k) => k + 1);
+    if (interrupted) {
+      const prompt = "Continue where you left off.";
+      setEditor({ value: prompt, cursor: prompt.length });
+      void persist(); // the restored partial is now part of the history
+    }
   };
 
   const sessionLists = () => {
@@ -1364,6 +1519,17 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     else info("Verbose off — thinking is summarised as \"Thought for …\" and tool output is previewed.");
   };
 
+  // ---------- /stats ----------
+
+  const statsCommand = () => {
+    const view = lastView.current;
+    const w = Math.min(size.columns - 6, 120);
+    const lines = view
+      ? statsLines({ ...view, stats: { ...view.stats!, firstOutputAt: undefined } }, sessionStats.current, Date.now(), w, false)
+      : statsLines(freshLive("waiting"), sessionStats.current, Date.now(), w, false).slice(-1);
+    push({ kind: "plain", text: [theme.bold(view ? "Stats · last turn and session" : "Stats · session"), ...lines, theme.dim("Shown live during every turn while /verbose is on.")].join("\n") });
+  };
+
   // ---------- /agents ----------
 
   const agentsCommand = () => {
@@ -1447,6 +1613,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         return agentsCommand();
       case "verbose":
         return verboseCommand(cmd.arg);
+      case "stats":
+        return statsCommand();
       case "fun":
         return funCommand(cmd.arg);
       case "api":
@@ -2104,7 +2272,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
       {turnActive && (
         <Box marginTop={1}>
-          <ActivityBar read={() => live.current} width={width} hint={stopHint} expanded={agentsExpanded} maxTaskRows={Math.max(2, Math.min(agentsExpanded ? 16 : 8, size.rows - 14))} />
+          <ActivityBar read={() => live.current} width={width} hint={stopHint} expanded={agentsExpanded} stats={verbose ? () => sessionStats.current : undefined} maxTaskRows={Math.max(2, Math.min(agentsExpanded ? 16 : 8, size.rows - 14))} />
         </Box>
       )}
 
@@ -2236,7 +2404,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         </Box>
       )}
 
-      <Footer width={width} model={model} effort={effort} skills={activeSkills.length} toolsMode={toolsMode} autoMode={autoMode} planMode={planMode} loggedIn={!!auth.key} flash={turnActive ? null : flash} queued={queueLen} ctx={usage ? { tokens: usage.ctx, approx: usage.approx } : null} goal={goal} loop={loop} verbose={verbose} />
+      <Footer width={width} model={model} effort={effort} skills={activeSkills.length} toolsMode={toolsMode} autoMode={autoMode} planMode={planMode} loggedIn={!!auth.key} flash={turnActive ? null : flash} queued={queueLen} ctx={usage ? { tokens: usage.ctx, approx: usage.approx } : null} goal={goal} loop={loop} verbose={verbose} session={sessionStats.current} />
     </>
   );
 }
@@ -2306,8 +2474,9 @@ function ApprovalBox({ approval, width }: { approval: Approval; width: number })
 
 /** The line under the input: model and modes on the left, context on the right.
  *  Parts drop out by priority as the terminal narrows. */
-function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, loggedIn, flash, queued, ctx, goal, loop, verbose }: {
+function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, loggedIn, flash, queued, ctx, goal, loop, verbose, session }: {
   verbose: boolean;
+  session?: SessionStats;
   width: number; model: string; effort: Effort; skills: number; toolsMode: "off" | "read" | "cmds" | "yolo"; autoMode: "ask" | "auto"; planMode: "off" | "on"; loggedIn: boolean; flash: string | null; queued: number; ctx: { tokens: number; approx: boolean } | null; goal: Goal | null; loop: LoopState | null;
 }) {
   const [, setTick] = useState(0);
@@ -2325,6 +2494,7 @@ function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, l
   if (planMode === "on" && (toolsMode === "cmds" || toolsMode === "yolo")) parts.push([theme.dim("plan"), 3]);
   if (effort !== "auto") parts.push([theme.dim(`effort ${effort}`), 2]);
   if (verbose) parts.push([tone.thinking("verbose"), 5]);
+  if (verbose && session && session.turns) parts.push([theme.dim(`Σ ↑${formatTokens(session.tokensIn)} ↓${formatTokens(session.tokens)} · ${session.tools} tools`), 3]);
   if (skills) parts.push([theme.dim(`${skills} skill${skills === 1 ? "" : "s"}`), 2]);
   if (goal) parts.push([tone.goal(`◎ goal ${goal.turns}/${goal.maxTurns}`), 8]);
   if (loop) parts.push([tone.agent(`↻ loop${loop.nextAt ? ` ${formatDuration(Math.max(0, loop.nextAt - Date.now()))}` : loop.lastReason === "paused" ? " paused" : " running"}`), 8]);

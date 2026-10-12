@@ -35,6 +35,7 @@ Environment
   UNJAILED_HOME       config directory (default ~/.unjailed)
   UNJAILED_TIMEOUT    header/idle timeout in seconds (default 120)
   UNJAILED_REASONING_TIMEOUT  no-answer/tool-call deadline in seconds (default 180)
+  UNJAILED_AUTOSAVE_SECONDS  autosave interval for the open chat (default 10)
   UNJAILED_NO_HISTORY set to 1 to stop saving chats (disables /resume)
   UNJAILED_NO_FX      set to 1 to turn off the fun effects (wink, snow)
   NO_COLOR            disable colors

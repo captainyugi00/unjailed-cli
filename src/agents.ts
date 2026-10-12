@@ -67,6 +67,9 @@ export interface SubagentActivity {
   toolCalls: number;
   /** The end of the subagent's current thinking, for verbose views. */
   thought?: string;
+  /** Requests sent (retries included) and transient failures waited out. */
+  requests: number;
+  retries: number;
 }
 
 export interface SubagentRun {
@@ -101,7 +104,7 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
     { role: "system", content: `${run.systemPrompt}\n\n${SUBAGENT_NOTE}` },
     { role: "user", content: run.prompt },
   ];
-  const act: SubagentActivity = { state: "waiting", tokensIn: 0, tokens: 0, reasoning: 0, toolCalls: 0 };
+  const act: SubagentActivity = { state: "waiting", tokensIn: 0, tokens: 0, reasoning: 0, toolCalls: 0, requests: 0, retries: 0 };
   let completion = 0; // reported completion tokens
   let reportedReasoning = 0;
   let streamedChars = 0; // this request, until its usage arrives
@@ -116,7 +119,7 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
     run.onActivity?.({ ...act });
   };
   const handlers: AgentHandlers = {
-    onRequest: () => emit("waiting"),
+    onRequest: () => { act.requests++; emit("waiting"); },
     onToken: (t) => { streamedChars += t.length; emit(act.state === "writing" ? undefined : "writing"); },
     onReasoning: (t) => {
       streamedChars += t.length;
@@ -139,7 +142,7 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
       run.onTool?.(name, args);
       emit("tool", run.describeCall ? run.describeCall(name, args) : name);
     },
-    onRetry: (info) => { emit("retrying", info.reason); run.onRetry?.(info); },
+    onRetry: (info) => { act.retries++; emit("retrying", info.reason); run.onRetry?.(info); },
   };
   const res = await agentTurn(run.baseUrl, run.key, run.model, history, handlers, run.signal, {
     effort: run.effort,

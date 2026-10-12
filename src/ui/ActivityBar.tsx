@@ -47,6 +47,9 @@ export interface AgentStat {
   /** Reasoning tokens (reported by the server, or estimated from streamed thinking). */
   reasoning?: number;
   phase?: string;
+  /** Requests sent and transient failures retried (verbose stats). */
+  requests?: number;
+  retries?: number;
 }
 
 /** A task in the panel is one agent's stats. */
@@ -64,6 +67,130 @@ export interface LiveView {
   groups: TaskGroup[];
   /** Every agent of this turn, finished ones included (the expanded view). */
   all?: AgentStat[];
+  /** Counters for the verbose stats panel. */
+  stats?: TurnStats;
+}
+
+/** Live counters for one turn (/verbose stats). */
+export interface TurnStats {
+  /** Requests the main agent sent, retries included. */
+  requests: number;
+  retries: number;
+  /** Automatic recoveries: resumed replies, nudges, continues. */
+  recoveries: number;
+  /** Time to first token of the latest request, and the average. */
+  ttftLastMs?: number;
+  ttftTotalMs: number;
+  ttftCount: number;
+  /** When output first arrived this turn, for throughput. */
+  firstOutputAt?: number;
+  /** Prompt size of the latest request (context in use). */
+  contextTokens?: number;
+  /** Tool calls by kind, main agent and subagents together. */
+  tools: Record<string, number>;
+}
+
+/** Running totals for the whole session (/verbose stats, /stats). */
+export interface SessionStats {
+  turns: number;
+  workMs: number;
+  requests: number;
+  retries: number;
+  recoveries: number;
+  tokensIn: number;
+  tokens: number;
+  reasoning: number;
+  tools: number;
+  agents: number;
+}
+
+export const emptyTurnStats = (): TurnStats => ({ requests: 0, retries: 0, recoveries: 0, ttftTotalMs: 0, ttftCount: 0, tools: {} });
+export const emptySessionStats = (): SessionStats => ({ turns: 0, workMs: 0, requests: 0, retries: 0, recoveries: 0, tokensIn: 0, tokens: 0, reasoning: 0, tools: 0, agents: 0 });
+
+const label = (s: string) => theme.bold(s);
+const sec = (ms: number) => (ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : formatElapsed(ms));
+
+/**
+ * The verbose stats panel: this turn (requests, latency, throughput, tokens,
+ * tools, agents, recoveries) and the session totals. Lines are fitted to the
+ * width; nothing wraps.
+ */
+export function statsLines(view: LiveView, sessionBefore: SessionStats, now: number, width: number, live = true): string[] {
+  // Live, the session line includes the turn in progress.
+  const session = live ? addTurnToSession(sessionBefore, view, now - view.activity.startedAt) : sessionBefore;
+  const st = view.stats ?? emptyTurnStats();
+  const agents = (view.all ?? [view.main]).filter((a) => !a.main);
+  const everyone = view.all ?? [view.main];
+  const sum = (k: "tokensIn" | "tokens" | "reasoning") => everyone.reduce((n, a) => n + (a[k] ?? 0), 0);
+  const tin = sum("tokensIn");
+  const tout = sum("tokens");
+  const rsn = sum("reasoning");
+  const subRequests = agents.reduce((n, a) => n + (a.requests ?? 0), 0);
+  const subRetries = agents.reduce((n, a) => n + (a.retries ?? 0), 0);
+  const requests = st.requests + subRequests;
+  const retries = st.retries + subRetries;
+  const outSecs = st.firstOutputAt ? Math.max(0.5, (now - st.firstOutputAt) / 1000) : 0;
+  const rate = outSecs ? Math.round(tout / outSecs) : 0;
+  const toolTotal = Object.values(st.tools).reduce((a, b) => a + b, 0);
+  const kinds = (["read", "edit", "shell", "web", "agent", "other"] as const).filter((k) => st.tools[k]).map((k) => `${k} ${st.tools[k]}`);
+  const running = agents.filter((a) => a.status === "running").length;
+  const done = agents.filter((a) => a.status === "done").length;
+  const failed = agents.filter((a) => a.status === "failed").length;
+
+  const line1 = [
+    `${label("Requests")} ${requests}${retries ? tone.retrying(` (${retries} retried)`) : ""}`,
+    st.ttftLastMs !== undefined ? `${label("first token")} ${sec(st.ttftLastMs)}${st.ttftCount > 1 ? ` (avg ${sec(st.ttftTotalMs / st.ttftCount)})` : ""}` : "",
+    rate ? `${label("speed")} ${rate} tok/s` : "",
+    st.contextTokens ? `${label("context")} ${formatTokens(st.contextTokens)}` : "",
+  ];
+  const line2 = [
+    `${label("Tokens")} ↑ ${formatTokens(tin)} in`,
+    `↓ ${formatTokens(tout)} out`,
+    rsn ? tone.thinking(`∴ ${formatTokens(rsn)} thinking`) : "",
+    `Σ ${formatTokens(tin + tout)}`,
+  ];
+  const line3 = [
+    `${label("Tools")} ${toolTotal}${kinds.length ? ` (${kinds.join(", ")})` : ""}`,
+    agents.length ? `${label("Agents")} ${agents.length}${running ? ` · ${running} running` : ""}${done ? ` · ${done} done` : ""}${failed ? tone.failed(` · ${failed} failed`) : ""}` : "",
+    st.recoveries ? `${label("recoveries")} ${st.recoveries}` : "",
+  ];
+  const line4 = [
+    `${label("Session")} ${session.turns} turn${session.turns === 1 ? "" : "s"}`,
+    formatElapsed(session.workMs),
+    `↑ ${formatTokens(session.tokensIn)}`,
+    `↓ ${formatTokens(session.tokens)}`,
+    session.reasoning ? `∴ ${formatTokens(session.reasoning)}` : "",
+    `${session.tools} tools`,
+    `${session.requests} requests`,
+    session.retries ? `${session.retries} retried` : "",
+  ];
+  const fit = (parts: string[]) => {
+    const kept = parts.filter(Boolean);
+    while (kept.length > 1 && visible(kept.join(theme.dim(" · "))) > width) kept.pop();
+    const line = kept.join(theme.dim(" · "));
+    // A single item wider than the terminal is clipped rather than wrapped.
+    return visible(line) > width ? clip(strip(line), width) : line;
+  };
+  return [fit(line1), fit(line2), fit(line3), theme.dim(strip(fit(line4)))];
+}
+
+/** Add a finished turn's numbers to the session totals. */
+export function addTurnToSession(session: SessionStats, view: LiveView, elapsedMs: number): SessionStats {
+  const st = view.stats ?? emptyTurnStats();
+  const everyone = view.all ?? [view.main];
+  const agents = everyone.filter((a) => !a.main);
+  return {
+    turns: session.turns + 1,
+    workMs: session.workMs + elapsedMs,
+    requests: session.requests + st.requests + agents.reduce((n, a) => n + (a.requests ?? 0), 0),
+    retries: session.retries + st.retries + agents.reduce((n, a) => n + (a.retries ?? 0), 0),
+    recoveries: session.recoveries + st.recoveries,
+    tokensIn: session.tokensIn + everyone.reduce((n, a) => n + (a.tokensIn ?? 0), 0),
+    tokens: session.tokens + everyone.reduce((n, a) => n + (a.tokens ?? 0), 0),
+    reasoning: session.reasoning + everyone.reduce((n, a) => n + (a.reasoning ?? 0), 0),
+    tools: session.tools + Object.values(st.tools).reduce((a, b) => a + b, 0),
+    agents: session.agents + agents.length,
+  };
 }
 
 const VERBS: Record<Phase, string> = {
@@ -215,7 +342,7 @@ export function agentsTable(rows: AgentStat[], width: number, now: number, frame
 
 /** `read` is polled on every animation frame, so fast-changing counters
  *  (tokens, the current tool) never force the whole app to re-render. */
-export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = false }: { read: () => LiveView; width: number; hint: string; maxTaskRows?: number; expanded?: boolean }) {
+export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = false, stats }: { read: () => LiveView; width: number; hint: string; maxTaskRows?: number; expanded?: boolean; stats?: () => SessionStats }) {
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 120);
@@ -228,6 +355,17 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
   const subagents = groups.reduce((n, g) => n + g.tasks.length, 0);
   const toggle = width >= 90 ? `ctrl+t ${expanded ? "collapse" : "agents"}` : "";
   const fullHint = [hint, subagents || expanded ? toggle : ""].filter(Boolean).join(" · ");
+  const statRows = stats ? statsLines(read(), stats(), now, Math.max(20, width - 6)) : [];
+  const statsBox = statRows.length ? (
+    <Box flexDirection="column" marginTop={1}>
+      {statRows.map((r, i) => (
+        <Text key={i} wrap="truncate-end">
+          {theme.dim(i === 0 ? "  ▸ " : "    ")}
+          {r}
+        </Text>
+      ))}
+    </Box>
+  ) : null;
   const retrySecs = activity.retry ? Math.max(0, Math.ceil((activity.retry.until - now) / 1000)) : 0;
   const retryRow = activity.retry ? tone.retrying(clip(`⚠ ${activity.retry.reason} — retrying ${retrySecs ? `in ${retrySecs}s` : "now"} (attempt ${activity.retry.attempt})`, width - 8)) : null;
 
@@ -254,6 +392,7 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
           ))}
           {rows.length > shown.length && <Text>{theme.dim(`… ${rows.length - shown.length} more`)}</Text>}
         </Box>
+        {statsBox}
       </Box>
     );
   }
@@ -284,6 +423,7 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
           {r}
         </Text>
       ))}
+      {statsBox}
     </Box>
   );
 }

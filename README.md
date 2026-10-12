@@ -63,6 +63,7 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 | `/workflow <name> [args]` | Run a saved multi-agent workflow (see [Subagents and workflows](#subagents-and-workflows)). `/workflow new <name>` creates one from a template. |
 | `/workflows` | List saved workflows. |
 | `/verbose [on\|off]` | Show what the model is thinking: its reasoning streams into the transcript as dimmed `∴` blocks, each subagent's tool calls are listed, and tool results show up to 40 lines. Ctrl+O toggles. Remembered between runs. |
+| `/stats` | Requests (and retries), time to first token, speed, context size, input/output/reasoning tokens, tools by kind, agents and recoveries for the last turn, plus session totals. |
 | `/agents` | Show every agent of the last turn (main agent, subagents, workflow agents): status, time, tool uses, and input/output/reasoning tokens. |
 | `/resume` | Pick up a previous chat from the current folder. `/resume 2` or `/resume <id>` jumps straight to one. |
 | `/sessions` | Browse saved chats from every folder: resume one, or press `d` to delete it. |
@@ -113,6 +114,13 @@ reported by the server, or estimated from streamed thinking). States are
 color-coded: thinking, writing, running a tool, waiting for approval,
 reconnecting, done, failed. Columns drop out on narrow terminals. `/agents`
 prints the same table for the last turn after it ends.
+
+**Live stats (verbose).** While `/verbose` is on, a stats panel under the
+status line updates in real time: requests and retries, time to first token,
+output speed, context size, input/output/reasoning tokens, tool calls by kind,
+agents running and done, automatic recoveries, and the session totals. The
+footer keeps the session totals when idle. `/stats` prints the same numbers at
+any time.
 
 **Verbose.** By default, thinking is summarised as `✻ Thought for 12s` and
 tool output as a short preview. `/verbose` (or Ctrl+O, even mid-turn) shows the
@@ -203,7 +211,20 @@ a security sandbox: run only workflows you trust, like any script.
 
 ## Sessions
 
-Chats are saved automatically after each reply, tagged with the folder you started `unjailed` in, so each project keeps its own history.
+Every chat is saved automatically and tagged with the folder you started
+`unjailed` in, so each project keeps its own history: `/resume` lists that
+folder's chats, and ↑ recalls the prompts you typed there in earlier sessions.
+
+Saving never waits for a turn to finish. Your message is saved when you send
+it, each tool result as it completes, and everything else (including the
+reply while it streams) by an autosave every 10 seconds
+(`UNJAILED_AUTOSAVE_SECONDS`). If you close the terminal, press Ctrl+C or the
+CLI is killed mid-run, `/resume` (or `unjailed -c`) brings the chat back
+entirely: messages, tool results in their places, the partial reply of the
+interrupted turn, pinned notes, skills, model, ↑ history, session stats, and
+any `/goal` or `/loop` (restored paused, so nothing runs on its own). The
+input box is pre-filled with "Continue where you left off." so Enter picks the
+work back up.
 
 Long chats automatically shorten older **request context** to keep the terminal
 and requests responsive. Requests target about 96,000 characters and 160 recent
@@ -211,27 +232,11 @@ messages; the initial task, system instructions, recent turns and complete live
 tool-call/result groups are retained. These are targets: a large active tool
 group or protected recent turn can exceed them. The CLI tells you when older
 request text was shortened or omitted. Your full chat text stays in the current
-session and in saved chats. The request now carries exact older requirements
-and excerpts relevant to your latest prompt, rather than simply losing the
-older window. In agent mode, the read-only `search_history` tool can search and
-recover exact previous messages and tool results, including after `/resume`.
-Recent tool evidence distinguishes completed actions from failed or skipped
-ones. `/remember <instruction>` keeps your most important constraints in each
-request; notes apply to this session and keep current tool permissions.
-`/clear` starts a fresh task and keeps the previous saved chat available through
-`/resume`.
-
-Long code blocks and large pasted drafts use a bounded live viewport. The full
-response prints when its block finishes; the full draft remains editable and
-is submitted unchanged. Completed output stays in terminal scrollback without
-being reformatted on every keypress. Saves append only new messages and tool
-results, avoiding a full-history rewrite after every reply. Existing saved
-chats migrate automatically on their next save.
-
-While a turn runs, an animated status stays visible through waiting, reasoning,
-writing, tool execution and permission prompts, including pauses after the first
-response text. It shows elapsed time and the stop shortcut. Waiting indicates an
-open request, not a guarantee that the server is making progress.
+session and in saved chats. In agent mode, the read-only `search_history` tool
+can search and recover exact previous messages and tool results, including
+after `/resume`. `/remember <instruction>` keeps your most important constraints
+in each request. `/clear` starts a fresh task and keeps the previous saved chat
+available through `/resume`.
 
 ```sh
 unjailed -c     # continue the most recent chat in this folder
@@ -350,6 +355,7 @@ command. Use `/auto` only when you want those actions to run without prompts.
 | `UNJAILED_HOME` | Config directory (default `~/.unjailed`) |
 | `UNJAILED_TIMEOUT` | Request/stream timeout in seconds (default 120 — reasoning models can think for a while before the first token) |
 | `UNJAILED_REASONING_TIMEOUT` | Seconds a stream may produce only reasoning, with no answer or tool call, before it stops (default 180) |
+| `UNJAILED_AUTOSAVE_SECONDS` | How often the open chat is autosaved, idle or mid-run (default 10) |
 | `UNJAILED_NO_HISTORY` | Set to `1` to stop saving chats (disables `/resume`) |
 | `UNJAILED_NO_FX` | Set to `1` to turn off the fun effects (wink, snow, sparkle) |
 | `NO_COLOR` | Turn off colors (also turns off the fun effects) |
