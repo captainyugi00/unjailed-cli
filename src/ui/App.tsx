@@ -12,7 +12,7 @@ import {
   type ChatMessage,
   type RetryInfo,
 } from "../api.js";
-import { COMMANDS, filterCommands, parseCommand } from "../commands.js";
+import { COMMANDS, filterCommands, parseCommand, runsMidTurn } from "../commands.js";
 import { configPath, deleteKey, EFFORTS, maskKey, readConfig, resolveBaseUrl, resolveKey, writeConfig, type Effort, type KeySource } from "../config.js";
 import { executeTool, toolDefinitions, type ToolDef } from "../tools.js";
 import { approvalAnswer } from "./approval.js";
@@ -1902,7 +1902,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const turnActive = working || !!stream;
   const slashQuery = mode.type === "chat" && /^\/\S*$/.test(editor.value) ? editor.value.slice(1) : null;
   const slashMatches = slashQuery !== null ? filterCommands(slashQuery) : [];
-  const menuOpen = slashQuery !== null && !turnActive && !busy;
+  // The menu also works while the agent runs; see runsMidTurn for what runs at once.
+  const menuOpen = slashQuery !== null && !busy;
 
   useEffect(() => setSlashSel(0), [slashQuery]);
 
@@ -1914,6 +1915,12 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     setEditor(EMPTY);
     // Busy? Don't reject it. Plain messages reach a working agent at its next
     // step; commands and plain-chat messages run when the turn finishes.
+    // Informational and stop commands run at once even mid-turn.
+    const cmd = text.startsWith("/") ? parseCommand(text) : null;
+    if (cmd && (turnActive || busy) && runsMidTurn(cmd.name, cmd.arg)) {
+      void runCommand(text);
+      return;
+    }
     if (turnActive || busy) {
       queueRef.current.push({ text, source: "user" });
       syncQueueLen();
@@ -2051,7 +2058,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       if (key.ctrl && input === "c") { planAnswerRef.current(false); abortRef.current?.abort(); }
       return;
     }
-    if (key.escape && abortRef.current && (turnActive || busy)) {
+    // With the slash menu open, Esc only closes the menu.
+    if (key.escape && abortRef.current && (turnActive || busy) && !menuOpen) {
       // Two-stage: first Esc arms, second Esc actually stops the running turn
       // (and the queue drains the next one). A stray Esc can't kill a long run.
       if (escArmed.current) {
@@ -2394,7 +2402,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         <Box flexDirection="column" marginLeft={1}>
           {slashMatches.length ? (
             <SelectList
-              items={slashMatches.map((c) => ({ key: c.name, label: `/${c.name}${c.args ? " " + c.args : ""}`, hint: c.description }))}
+              items={slashMatches.map((c) => ({ key: c.name, label: `/${c.name}${c.args ? " " + c.args : ""}`, hint: c.description + (turnActive && !runsMidTurn(c.name) ? theme.dim(" · runs when this turn ends") : "") }))}
               selected={slashSel}
               max={8}
             />

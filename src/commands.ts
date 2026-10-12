@@ -33,6 +33,19 @@ export const COMMANDS: CommandSpec[] = [
   { name: "exit", description: "Quit Unjailed" },
 ];
 
+/** Commands that only show something or change a harmless setting run at
+ *  once, even while the agent is working; everything else waits for the
+ *  turn to end. Stopping a goal or loop is immediate on purpose. */
+const MID_TURN = new Set(["help", "verbose", "stats", "agents", "context", "workflows", "remember"]);
+
+export function runsMidTurn(name: string, arg = ""): boolean {
+  const a = arg.trim().toLowerCase();
+  if (MID_TURN.has(name)) return true;
+  if (name === "goal") return a === "" || ["clear", "off", "stop", "cancel"].includes(a);
+  if (name === "loop") return a === "" || ["stop", "off", "cancel", "clear"].includes(a);
+  return false;
+}
+
 /** Commands matching what's typed after "/", prefix matches first. */
 export function filterCommands(query: string): CommandSpec[] {
   const q = query.toLowerCase();

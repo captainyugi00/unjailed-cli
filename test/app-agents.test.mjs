@@ -262,3 +262,26 @@ test("/verbose shows live stats during a turn; /stats reports the turn and the s
     await waitFor(ui, /Σ ↑[\d.]+k? ↓\d+/, "session totals in the footer");
   } finally { ui.unmount(); writeConfig({ verbose: false }); }
 });
+
+test("the slash menu works while the agent runs; info commands run at once, others wait for the turn", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false, verbose: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:batch go");
+    await waitFor(ui, /Bash\(sleep 1/, "turn running");
+    ui.stdin.write("/");
+    await sleep(120);
+    const menu = ui.lastFrame();
+    assert.match(menu, /\/login\s+Log in with your API key/, "commands and descriptions are listed mid-turn");
+    assert.match(menu, /runs when this turn ends/, "commands that wait are marked");
+    ui.stdin.write("\x1b"); await sleep(120);
+    assert.doesNotMatch(ui.lastFrame(), /Press Esc again to stop/, "Esc closed the menu without arming stop");
+    await type(ui, "/stats");
+    await waitFor(ui, /Stats · session/, "/stats ran immediately");
+    assert.doesNotMatch(all(ui), /Worked for/, "…while the turn was still running");
+    await type(ui, "/effort low");
+    await waitFor(ui, /Queued — runs when this turn ends · \/effort low/, "other commands wait");
+    await waitFor(ui, /Worked for[\s\S]*Effort set to low/, "and run after the turn", 15_000);
+  } finally { ui.unmount(); writeConfig({ effort: "auto" }); }
+});
