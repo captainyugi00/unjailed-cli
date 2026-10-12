@@ -2,7 +2,7 @@
 
 <h1 align="center">Unjailed CLI</h1>
 
-<p align="center">Chat with <a href="https://unjailedai.com">Unjailed AI</a> from your terminal. It streams responses, renders markdown in clean boxes, runs an agent toolkit, tracks your token usage, and sends no telemetry.</p>
+<p align="center">Chat with <a href="https://unjailedai.com">Unjailed AI</a> from your terminal. It streams responses, renders markdown cleanly, runs a coding agent with subagents and multi-agent workflows, keeps working toward goals and on loops, rides out outages, and sends no telemetry.</p>
 
 ## Install
 
@@ -57,7 +57,12 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 | `/fun` | Toggle the fun effects — the startup wink, side snow and finish sparkle. `/fun off` turns them off; the choice is saved. Effects are off automatically when output is piped, `NO_COLOR` is set, or the terminal is small. |
 | `/update` | Update the CLI to the latest version from npm. |
 | `/auto` (`/bypass`) | Auto-approve enabled tools. In read/off mode it opens the permission picker; access changes only after your selection. `/auto off` restores confirmations, including when automatic tools were selected. Plan approvals still apply when plan mode is on. |
-| `/plan` | Plan mode: before writing files or running commands, the agent shows a numbered plan — Enter approves, Esc rejects. `/plan off` disables. |
+| `/plan` | Plan mode: before writing files or running commands, the agent shows a numbered plan — `y`/Enter approves, `n`/Esc rejects. `/plan off` disables. |
+| `/goal <condition>` | Keep working until the condition holds, e.g. `/goal npm test passes with no failures`. After every turn an independent evaluator checks the evidence; if the goal isn't met, the agent continues with the evaluator's feedback. Up to 20 turns (`--max N`, at most 100). `/goal` shows progress, `/goal clear` stops, `/goal resume` continues a paused goal. |
+| `/loop [interval] <prompt>` | Repeat a prompt or `/command`: `/loop 5m check the deploy`, `/loop run the tests every 2h`. Without an interval the agent paces itself, choosing each delay (1 minute – 1 hour) or ending the loop when its job is done. `/loop` shows status, `/loop stop` ends it. |
+| `/workflow <name> [args]` | Run a saved multi-agent workflow (see [Subagents and workflows](#subagents-and-workflows)). `/workflow new <name>` creates one from a template. |
+| `/workflows` | List saved workflows. |
+| `/agents` | Show every agent of the last turn (main agent, subagents, workflow agents): status, time, tool uses, and input/output/reasoning tokens. |
 | `/resume` | Pick up a previous chat from the current folder. `/resume 2` or `/resume <id>` jumps straight to one. |
 | `/sessions` | Browse saved chats from every folder: resume one, or press `d` to delete it. |
 | `/clear` | Start a new chat and clear the screen. The previous chat stays saved. |
@@ -71,6 +76,115 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 ```sh
 npm install -g unjailed@latest
 ```
+
+## What you see while the agent works
+
+Every turn shows a live status line until it ends:
+
+```
+✻ Running… (1m 12s · ↓ 3.4k tokens · Bash(npm test) · esc esc to stop)
+  ⎿  ◐ Find auth call sites  Search("login")  14s · 1.1k tok
+     ✓ Review tests  31s
+```
+
+It says what is happening (waiting for the model, thinking, writing, running a
+tool, waiting for your approval, coordinating subagents, checking a goal,
+reconnecting), how long the turn has run, how many tokens it has produced, and
+what each subagent is doing. Tool calls print as compact blocks: `Read(file)`,
+`Update(file)` with a colored diff, `Bash(command)` with its output, and
+`Agent(task)` with `Done (4 tool uses · 2.1k tokens · 18s)`.
+
+**Agents view.** Press **Ctrl+T** while a turn runs to expand the panel into a
+live table of every agent, the main agent included:
+
+```
+╭ Agents  Workflow review · Verify · 2/3 done ─────────────────────────────────╮
+│   Agent              Status              Time  Tools   ↑ In  ↓ Out  ∴ Think │
+│ ◐ main agent         coordinating      1m 12s      3  12.4k   3.1k      820 │
+│ ◐ Review api         Read(src/api.ts)     32s      6   8.2k   1.2k      400 │
+│ ✓ Review tests       done                 18s      4   5.1k    900        – │
+│   Total              3 agents                     13  25.7k   5.2k    1.2k  │
+╰─────────────────────────────────────────────────────────────────────────────╯
+```
+
+↑ is input (prompt) tokens, ↓ output tokens, and ∴ reasoning tokens (as
+reported by the server, or estimated from streamed thinking). States are
+color-coded: thinking, writing, running a tool, waiting for approval,
+reconnecting, done, failed. Columns drop out on narrow terminals. `/agents`
+prints the same table for the last turn after it ends.
+
+Every turn ends with a line saying what happened: `✻ Worked for 1m 12s · 9 tool
+calls · ↓ 3.4k tokens`, or why it stopped. A turn never ends silently.
+
+**Messages while the agent works.** Type and press Enter at any time. With
+tools on, your message goes to the agent at its next step, so you can steer
+it mid-task. Commands and plain-chat messages queue and run when the turn ends.
+
+**Permission prompts** show the exact command, file content or diff. Press `y`
+to allow it once, `a` to allow that tool for the rest of the session, or `n`/Esc
+to decline.
+
+## Reliability
+
+- **Outages are waited out, not fatal.** Network errors, timeouts, stalled
+  streams, `5xx`, `429` and overload responses are retried automatically with
+  exponential backoff (1s, 2s, 4s … up to 60s, honoring `Retry-After`) until
+  the service answers. The status line shows a countdown. Esc Esc stops waiting.
+  Invalid keys, missing credit and malformed requests stop at once with a clear
+  message.
+- **Cut-off replies are resumed.** If a stream ends early or the connection
+  drops mid-reply, the agent continues from where it stopped instead of
+  starting over, and you see a note saying so.
+- **No silent stops.** When a reply hits the output limit, the agent continues
+  it. When the agent announces a step ("Now I'll update the tests:") but
+  doesn't take it, it's prompted to carry on. Tool calls whose arguments were
+  cut off are never executed. Instead, the agent is told to retry with smaller
+  pieces.
+- **Clean output.** Colors, cursor movement, carriage-return progress bars and
+  tabs in command output or model replies are normalized before display, so
+  long sessions don't drift out of alignment. Layout adapts to the terminal
+  width and is reprinted on resize.
+
+## Subagents and workflows
+
+With tools on, the agent can start **subagents** (the `agent` tool): fresh
+agents with their own empty context that take on one focused task, such as
+searching a codebase or reviewing a module, and report back. Several subagents
+started together run in parallel, and each appears live in the status panel.
+Subagents use the same permissions as the main agent and can't start more
+subagents.
+
+With `/tools cmds` or `yolo`, the agent can also run **workflows**: short
+JavaScript scripts that orchestrate many subagents deterministically.
+
+```js
+export const meta = { name: "review", description: "Review each area, then verify" };
+
+const areas = Array.isArray(args) ? args : ["error handling", "tests"];
+phase("Review");
+const reports = await parallel(areas.map((area) => () =>
+  agent(`Review ${area}. Report findings with file:line.`, { label: area })));
+phase("Verify");
+return await pipeline(reports.filter(Boolean), (report) =>
+  agent(`Verify each finding below by reading the code:\n${report}`, {
+    label: "verify",
+    schema: { type: "object", properties: { confirmed: { type: "array" } } },
+  }));
+```
+
+| Function | Purpose |
+|---|---|
+| `agent(prompt, { label, phase, schema })` | Run a subagent; returns its report, or parsed JSON when `schema` is given |
+| `parallel([() => …, …])` | Run thunks concurrently; a failed item becomes `null` |
+| `pipeline(items, stage1, stage2, …)` | Each item flows through the stages independently: `(previous, item, index)` |
+| `phase(title)`, `log(message)`, `args` | Progress labels, log lines, and the arguments passed in |
+
+A workflow can start at most 16 agents, 4 at a time. In `cmds` mode you approve
+the workflow first, and its subagents still ask before each change. Save
+workflows as `.unjailed/workflows/<name>.js` (this project) or
+`~/.unjailed/workflows/<name>.js` (everywhere). Run one with `/workflow <name>`,
+or ask the agent to. Scripts run in a separate JavaScript context, which is not
+a security sandbox: run only workflows you trust, like any script.
 
 ## Sessions
 
@@ -143,6 +257,8 @@ you approve each action. It works on Linux, macOS and Windows.
 | `/tools yolo` | Same as `cmds`, changes and commands run without confirmation |
 | `/tools off` | Plain chat (default) |
 
+In every tools mode the agent can also start [subagents](#subagents-and-workflows) with the same permissions; workflows need `cmds` or `yolo`.
+
 The toolkit:
 
 | Tool | What it does |
@@ -162,6 +278,8 @@ The toolkit:
 | `run_command` | Shell with `cwd`, `timeout_ms` and `background` options (cmds/yolo) |
 | `process_status` | Read a background job's status and recent output |
 | `stop_process` | Stop a background job and its children (cmds/yolo) |
+| `agent` | Start a subagent for a focused task; several run in parallel |
+| `workflow` | Run a multi-agent workflow script (cmds/yolo) |
 
 Commands run through `cmd /d /s /c` on Windows and `/bin/sh -c` elsewhere.
 `run_command` accepts `cwd` so the agent can build and run projects anywhere your
@@ -196,11 +314,13 @@ command. Use `/auto` only when you want those actions to run without prompts.
 
 | Key | Action |
 |---|---|
-| Enter | Send. If a reply is already streaming, your message is **queued** and runs as soon as the current one finishes (the status line shows how many are waiting). |
+| Enter | Send. While the agent works (tools on), your message is delivered to it at its next step. Otherwise it's **queued** and runs when the current turn finishes (the footer shows how many are waiting). |
 | Shift+Enter, or `\` then Enter | New line. Alt+Enter and Ctrl+J also work, for terminals that don't report Shift+Enter. |
 | ↑ / ↓ | Step through your previous inputs |
 | Paste | Multi-line pastes stay in the input box; they're never sent until you press Enter |
-| Esc | Close menus. While a reply is running, press Esc **twice** to stop it and move on to the next queued prompt (the first press arms it, so a stray Esc won't kill a long reply). |
+| Esc | Close menus. While a turn is running, press Esc **twice** to stop it (the first press arms it, so a stray Esc won't kill a long run). This also stops subagents, workflows and retry waits. |
+| y / a / n | Answer a permission prompt: allow once, allow that tool for the session, decline |
+| Ctrl+T | Expand or collapse the live agents view |
 | Ctrl+C | Stops the response while one is streaming. Otherwise clears the input; press it twice to exit. |
 | Ctrl+D | Exit |
 
@@ -213,6 +333,7 @@ command. Use `/auto` only when you want those actions to run without prompts.
 | `UNJAILED_MODEL` | Model to start with |
 | `UNJAILED_HOME` | Config directory (default `~/.unjailed`) |
 | `UNJAILED_TIMEOUT` | Request/stream timeout in seconds (default 120 — reasoning models can think for a while before the first token) |
+| `UNJAILED_REASONING_TIMEOUT` | Seconds a stream may produce only reasoning, with no answer or tool call, before it stops (default 180) |
 | `UNJAILED_NO_HISTORY` | Set to `1` to stop saving chats (disables `/resume`) |
 | `UNJAILED_NO_FX` | Set to `1` to turn off the fun effects (wink, snow, sparkle) |
 | `NO_COLOR` | Turn off colors (also turns off the fun effects) |
@@ -240,7 +361,11 @@ UNJAILED_BASE_URL=http://localhost:8787/v1 UNJAILED_HOME=./.dev node dist/index.
 npm test          # unit + integration tests against the mock
 ```
 
-Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior.
+Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
+
+The CLI continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
+
+GLM 5.3 CLI requests default to low reasoning on the hosted API. `/effort high` remains available; the CLI's medium level maps to GLM's high level. Streams producing no answer or tool call stop after 180 seconds by default. Set `UNJAILED_REASONING_TIMEOUT` in seconds to override that deadline; `UNJAILED_TIMEOUT` controls header and idle timeouts (default 120 seconds). These controls improve response handling but cannot guarantee a model completes every task.
 
 The default API URL is set in `src/constants.ts` (`DEFAULT_BASE_URL`).
 
@@ -264,7 +389,3 @@ MIT · [github.com/unjailedai/unjailedCLI](https://github.com/unjailedai/unjaile
 ### Coding reliability (0.12.4)
 
 Update with `/update` or `npm install -g unjailed@latest`. Enable file and command access with `/tools cmds`; every change and command still asks for approval unless you explicitly enable automatic approval.
-
-The CLI now continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
-
-GLM 5.3 CLI requests default to low reasoning on the hosted API. `/effort high` remains available; the CLI's medium level maps to GLM's high level. Streams producing no answer or tool call stop after 180 seconds by default. Set `UNJAILED_REASONING_TIMEOUT` in seconds to override that deadline; `UNJAILED_TIMEOUT` controls header and idle timeouts (default 120 seconds). These controls improve response handling but cannot guarantee a model completes every task.
