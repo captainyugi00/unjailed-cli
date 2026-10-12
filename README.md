@@ -50,13 +50,13 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 | `/model <id>` | Switch straight to a model by its id. |
 | `/effort` | Set reasoning effort: `auto` (default; the model decides), `low`, `medium` or `high`. `/effort high` sets it directly. Remembered between runs. |
 | `/skills` | Switch skills on or off for this chat (Space toggles). `/skills <name>` toggles one; `/skills new <name>` creates one. |
-| `/tools` | Agent tools. No argument: the model can read files and list directories. `cmds` enables file changes, launches and commands with approval for each action; `yolo` skips asking; `off` disables. |
+| `/tools` | Choose permissions from a menu: read-only, file changes/commands with confirmations, automatic tools, or off. `/tools cmds` directly enables confirmed changes and commands. |
 | `/api` | Show the base URL, masked key and current model, and run a live connection check. |
 | `/remember [text\|clear]` | Pin an important instruction for this session. No argument shows your notes; `clear` removes them. Saved notes return with `/resume`. |
 | `/context` | Show token usage for this chat: current context size, the last turn's prompt/completion tokens, message count and model. Numbers come from the API (or a `~` estimate if the server sends none). The context size also shows live in the status line as `ctx 12.4k`. |
 | `/fun` | Toggle the fun effects — the startup wink, side snow and finish sparkle. `/fun off` turns them off; the choice is saved. Effects are off automatically when output is piped, `NO_COLOR` is set, or the terminal is small. |
 | `/update` | Update the CLI to the latest version from npm. |
-| `/auto` (`/bypass`) | Auto-approve tool calls — the agent stops asking and just works. `/auto off` restores confirmations in `cmds` mode. It does not expand `read`/`off` permissions; select `/tools cmds` to leave `yolo`. |
+| `/auto` (`/bypass`) | Auto-approve enabled tools. In read/off mode it opens the permission picker; access changes only after your selection. `/auto off` restores confirmations, including when automatic tools were selected. Plan approvals still apply when plan mode is on. |
 | `/plan` | Plan mode: before writing files or running commands, the agent shows a numbered plan — Enter approves, Esc rejects. `/plan off` disables. |
 | `/resume` | Pick up a previous chat from the current folder. `/resume 2` or `/resume <id>` jumps straight to one. |
 | `/sessions` | Browse saved chats from every folder: resume one, or press `d` to delete it. |
@@ -132,13 +132,13 @@ Switched-on skills are sent as a system message with each request and re-read fr
 
 ## Agent tools
 
-`/tools` gives the model hands: it can read files and list directories on your
-machine, and answer using what it finds. It works the same on Linux, macOS and
-Windows.
+`/tools` opens a permission picker for tools that act on your computer. Choose
+file changes and commands to create folders, write programs and execute them;
+you approve each action. It works on Linux, macOS and Windows.
 
 | Mode | What the model can do |
 |---|---|
-| `/tools` | **Read-only:** read files, list directories, glob-find files, grep contents, read clipboard, fetch web pages, inspect background jobs |
+| `/tools read` | **Read-only:** read files, list directories, glob-find files, grep contents, read clipboard, fetch web pages, inspect background jobs |
 | `/tools cmds` | **+ write:** write/edit/move/delete files, launch apps, run commands — you confirm each action with `y` |
 | `/tools yolo` | Same as `cmds`, changes and commands run without confirmation |
 | `/tools off` | Plain chat (default) |
@@ -171,8 +171,11 @@ shortcuts. This is ordinary local-user access; OS permissions still apply.
 
 In `/tools cmds`, file writes/edits/moves/deletes, clipboard writes, app launches
 and commands require your approval. `/tools read` enforces read-only tools even
-if a model requests an unlisted tool. `/auto` and `/tools yolo` are explicit
-choices to skip prompts; `/auto` cannot unlock capabilities in read/off mode.
+if a model requests an unlisted tool. `/auto` in read/off mode asks you to choose
+access; cancel keeps the current permissions. `/tools cmds` always enables
+confirmations, even if auto approval was previously active. `/tools yolo` or
+`/auto` with enabled command tools skips per-action prompts by your choice;
+`/auto off` restores them.
 Plan mode requires an approved plan before tasks in cmds/yolo mode; if planning
 fails, execution stops.
 

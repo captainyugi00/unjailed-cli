@@ -56,7 +56,15 @@ type Mode =
   | { type: "sessions"; list: SessionMeta[]; selected: number; scope: "folder" | "all"; confirmDelete: boolean }
   | { type: "effort"; selected: number }
   | { type: "skills"; list: Skill[]; selected: number }
+  | { type: "tool-permissions"; selected: number }
   | { type: "plan-approve"; steps: string[]; selected: number }; // 0 = start, 1 = cancel
+
+const TOOL_CHOICES = [
+  { key: "read", label: "Read-only", hint: "inspect files; no changes or commands" },
+  { key: "cmds", label: "Files + commands", hint: "ask before each change or command" },
+  { key: "yolo", label: "Automatic", hint: "write files and run commands without asking" },
+  { key: "off", label: "Off", hint: "plain chat; no computer tools" },
+] as const;
 
 interface Stream {
   hiddenCharacters: number;
@@ -92,7 +100,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   // Agent tools: "off" | "read" (read_file+list_dir) | "cmds" (+run_command, confirmed) | "yolo" (+run_command, no confirm)
   const [toolsMode, setToolsMode] = useState<"off" | "read" | "cmds" | "yolo">(() => readConfig().tools ?? "off");
   /** Agent autonomy: ask (default) confirms commands · auto runs them · plan drafts first */
-  const [autoMode, setAutoMode] = useState<"ask" | "auto">(() => (readConfig().autoMode === "auto" ? "auto" : "ask"));
+  const [autoMode, setAutoMode] = useState<"ask" | "auto">(() => {
+    const config = readConfig();
+    return (config.tools === "cmds" || config.tools === "yolo") && config.autoMode === "auto" ? "auto" : "ask";
+  });
   /** Plan mode: model writes a plan first, user approves, then it executes */
   const [planMode, setPlanMode] = useState<"off" | "on">(() => (readConfig().plan === false ? "off" : "on"));
   // Skills switched on for this chat (by name). Their files are re-read on every request.
@@ -597,32 +608,41 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
   const toolsCommand = (arg: string) => {
     const next = arg.toLowerCase();
-    if (next === "" || next === "on" || next === "read") {
+    if (next === "" || next === "on") {
+      toolArmedAt.current = Date.now();
+      setMode({ type: "tool-permissions", selected: TOOL_CHOICES.findIndex((choice) => choice.key === toolsMode) });
+      return;
+    }
+    if (next === "read") {
       setToolsMode("read");
-      writeConfig({ tools: "read" });
+      setAutoMode("ask");
+      writeConfig({ tools: "read", autoMode: "ask" });
       success("Agent tools on — read files and clipboard, search, fetch pages.");
-      info("Add /tools cmds to also write files and run commands (you confirm each), /tools yolo to skip asking, /tools off to disable.");
+      info("Use /tools to choose file changes and commands, or /tools cmds to enable them with confirmations.");
       return;
     }
     if (next === "cmds" || next === "commands") {
       setToolsMode("cmds");
-      writeConfig({ tools: "cmds" });
+      setAutoMode("ask");
+      writeConfig({ tools: "cmds", autoMode: "ask" });
       success("Agent tools on — full toolkit: read/write/edit, search, run commands (you confirm each one).");
       return;
     }
     if (next === "yolo") {
       setToolsMode("yolo");
-      writeConfig({ tools: "yolo" });
+      setAutoMode("auto");
+      writeConfig({ tools: "yolo", autoMode: "auto" });
       success("Agent tools on — full toolkit, changes and commands run WITHOUT confirmation.");
       return;
     }
     if (next === "off") {
       setToolsMode("off");
-      writeConfig({ tools: "off" });
+      setAutoMode("ask");
+      writeConfig({ tools: "off", autoMode: "ask" });
       success("Agent tools off — plain chat.");
       return;
     }
-    error("Usage: /tools [off|cmds|yolo] — no argument turns on read-only tools.");
+    error("Usage: /tools [read|cmds|yolo|off] — no argument opens the permission picker.");
   };
 
   /** The system message for a request: the agent operating contract (only when
@@ -880,15 +900,20 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const off = arg.toLowerCase() === "off";
     if (off) {
       setAutoMode("ask");
-      writeConfig({ autoMode: "ask" });
-      success("Auto mode off — changes and commands ask for permission again (unless /tools yolo is selected).");
+      if (toolsMode === "yolo") setToolsMode("cmds");
+      writeConfig({ autoMode: "ask", ...(toolsMode === "yolo" ? { tools: "cmds" } : {}) });
+      success("Auto mode off — enabled changes and commands ask for permission again.");
+      return;
+    }
+    if (toolsMode !== "cmds" && toolsMode !== "yolo") {
+      info("Write and command tools are not enabled. Choose the access you want to allow.");
+      toolsCommand("");
       return;
     }
     setAutoMode("auto");
     writeConfig({ autoMode: "auto" });
     const label = from === "bypass" ? "/bypass" : "/auto";
     success(`${label} on — the agent makes changes and runs commands without asking. /auto off to restore confirmations.`);
-    if (toolsMode !== "cmds" && toolsMode !== "yolo") info("(No commands to auto-run yet — turn on /tools cmds first.)");
   };
 
   const planCommand = (arg: string) => {
@@ -1217,6 +1242,21 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     { isActive: mode.type === "effort" || mode.type === "skills" },
   );
 
+  useInput((input, key) => {
+    if (mode.type !== "tool-permissions" || key.ctrl || key.meta) return;
+    if (key.escape) { setMode({ type: "chat" }); return; }
+    if (Date.now() - toolArmedAt.current < 150) return;
+    if (key.upArrow) setMode({ ...mode, selected: (mode.selected - 1 + TOOL_CHOICES.length) % TOOL_CHOICES.length });
+    else if (key.downArrow || key.tab) setMode({ ...mode, selected: (mode.selected + 1) % TOOL_CHOICES.length });
+    else if (key.return && !key.shift) {
+      const choice = TOOL_CHOICES[mode.selected];
+      if (choice) {
+        setMode({ type: "chat" });
+        toolsCommand(choice.key);
+      }
+    }
+  }, { isActive: mode.type === "tool-permissions" });
+
   // Session picker keys.
   useInput(
     (input, key) => {
@@ -1365,6 +1405,14 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         </Box>
       )}
 
+      {mode.type === "tool-permissions" && (
+        <Box flexDirection="column" marginBottom={1}>
+          <Text>{theme.bold("Choose tool permissions")}{theme.dim("  ↑/↓ move · Enter select · Esc cancel")}</Text>
+          <Text>{theme.dim("File changes and commands run on your PC. Select the access you authorize.")}</Text>
+          <SelectList items={TOOL_CHOICES.map((choice) => ({ ...choice, current: choice.key === toolsMode }))} selected={mode.selected} max={4} />
+        </Box>
+      )}
+
       {mode.type === "plan-approve" && (
         <Box flexDirection="column" marginBottom={1}>
           <Text>
@@ -1401,7 +1449,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         </Box>
       )}
 
-      {mode.type !== "picker" && mode.type !== "sessions" && mode.type !== "effort" && mode.type !== "skills" && (
+      {mode.type !== "picker" && mode.type !== "sessions" && mode.type !== "effort" && mode.type !== "skills" && mode.type !== "tool-permissions" && (
         <Box flexDirection="column">
           <Text>{theme.dim("─".repeat(Math.max(10, width - 1)))}</Text>
           <Prompt

@@ -87,7 +87,7 @@ export function agentSystemPrompt(
     );
   } else {
     lines.push(
-      "- You are in read-only mode: you can read files, search, read the clipboard, and fetch pages, but you cannot write files or run commands. If the task needs those, say so and tell the user to turn on `/tools cmds`.",
+      "- You are in read-only mode: you can read files, search, read the clipboard, and fetch pages, but you cannot write files or run commands. For a task needing changes, tell the user to enable `/tools cmds` or choose file/command access in `/tools`, then repeat the task. Do not replace the requested work with a manual tutorial unless the user asks for one. Tool access changes only after the user chooses it.",
     );
   }
 
