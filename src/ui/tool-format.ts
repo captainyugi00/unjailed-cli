@@ -181,28 +181,31 @@ function editCounts(a: Args): { removed: number; added: number } {
 }
 
 /** The lines under "⎿" that summarise a finished call. */
-export function toolSummary(name: string, args: Args, ok: boolean, output: string, width = 100): string[] {
+export function toolSummary(name: string, args: Args, ok: boolean, output: string, width = 100, verbose = false): string[] {
   const w = Math.max(20, width - 8);
+  // Verbose (/verbose) shows up to 40 lines of output instead of a short preview.
+  const n = (lines: number) => (verbose ? Math.max(lines, 40) : lines);
   const out = sanitizeForDisplay(output).replace(/\s+$/, "");
   if (!ok) {
     const exit = name === "run_command" ? out.match(/\n(Exit code: \S+|Stopped[^\n]*|Timed out[^\n]*)$/)?.[1] : undefined;
     if (exit) {
       const body = out.slice(0, out.length - exit.length).trimEnd();
-      return [theme.err(exit), ...(body && body !== "(no output)" ? headLines(body, 4, w).map((l) => theme.dim(l)) : [])];
+      return [theme.err(exit), ...(body && body !== "(no output)" ? headLines(body, n(4), w).map((l) => theme.dim(l)) : [])];
     }
-    const lines = headLines(out || "Failed", 3, w);
+    const lines = headLines(out || "Failed", n(3), w);
     return [theme.err(lines[0]!), ...lines.slice(1).map((l) => theme.dim(l))];
   }
   const count = out ? out.split("\n").length : 0;
+  const detail = () => (verbose && out && !/^\((empty|no matches)\)$/.test(out) ? headLines(out, 40, w).map((l) => theme.dim(l)) : []);
   switch (name) {
     case "read_file":
-      return [`Read ${theme.bold(plural(count, "line"))}`];
+      return [`Read ${theme.bold(plural(count, "line"))}`, ...detail()];
     case "list_dir":
-      return [out === "(empty)" ? "Empty directory" : `Listed ${theme.bold(plural(count, "entry").replace("entrys", "entries"))}`];
+      return [out === "(empty)" ? "Empty directory" : `Listed ${theme.bold(plural(count, "entry").replace("entrys", "entries"))}`, ...detail()];
     case "glob":
-      return [out === "(no matches)" ? "No files found" : `Found ${theme.bold(plural(count, "file"))}`];
+      return [out === "(no matches)" ? "No files found" : `Found ${theme.bold(plural(count, "file"))}`, ...detail()];
     case "grep":
-      return [out === "(no matches)" ? "No matches" : `Found ${theme.bold(plural(count, "match").replace("matchs", "matches"))}`];
+      return [out === "(no matches)" ? "No matches" : `Found ${theme.bold(plural(count, "match").replace("matchs", "matches"))}`, ...detail()];
     case "write_file": {
       const lines = str(args.content).split("\n").length;
       return [`Wrote ${theme.bold(plural(lines, "line"))} to ${str(args.path)}`];
@@ -212,33 +215,33 @@ export function toolSummary(name: string, args: Args, ok: boolean, output: strin
       return [`Updated ${str(args.path)} · ${plural(removed, "line")} removed, ${added} added`, ...editDiff(args, w)];
     }
     case "agent":
-      return headLines(out, 3, w).map((l) => theme.dim(l));
+      return headLines(out, n(3), w).map((l) => theme.dim(l));
     case "workflow": {
       const result = out.split("\n\nResult:\n")[1]?.split("\n\nLog:\n")[0];
       const head = out.split("\n")[0]!;
-      if (!result) return /^Workflow ".*" finished/.test(head) ? [] : headLines(out, 3, w);
+      if (!result) return /^Workflow ".*" finished/.test(head) ? [] : headLines(out, n(3), w);
       let compact = result;
       try { compact = JSON.stringify(JSON.parse(result)); } catch { /* plain text result */ }
-      return [head, ...headLines(compact, 2, w).map((l) => theme.dim(l))];
+      return [head, ...headLines(compact, n(2), w).map((l) => theme.dim(l))];
     }
     case "run_command": {
       // The model gets "…output\nExit code: N"; people only need the code when it isn't 0.
       const body = out.replace(/\n*Exit code: 0$/, "").replace(/^\(no output\)$/, "").trimEnd();
-      return body ? headLines(body, 4, w).map((l) => theme.dim(l)) : [theme.dim("(no output)")];
+      return body ? headLines(body, n(4), w).map((l) => theme.dim(l)) : [theme.dim("(no output)")];
     }
     case "web_fetch":
     case "process_status":
-      return out ? headLines(out, 4, w).map((l) => theme.dim(l)) : [theme.dim("(no output)")];
+      return out ? headLines(out, n(4), w).map((l) => theme.dim(l)) : [theme.dim("(no output)")];
     default:
-      return out ? headLines(out, 2, w).map((l) => theme.dim(l)) : [theme.dim("Done")];
+      return out ? headLines(out, n(2), w).map((l) => theme.dim(l)) : [theme.dim("Done")];
   }
 }
 
 /** The complete transcript block for a finished tool call. */
-export function formatToolBlock(name: string, rawArgs: string, ok: boolean, output: string, width: number, note?: string): string {
+export function formatToolBlock(name: string, rawArgs: string, ok: boolean, output: string, width: number, note?: string, verbose = false): string {
   const args = parseArgs(rawArgs);
   const dot = ok ? theme.ok("●") : theme.err("●");
-  let summary = toolSummary(name, args, ok, output, width);
+  let summary = toolSummary(name, args, ok, output, width, verbose);
   // Subagent stats lead the block: "Done (4 tool uses · 2.1k tokens · 18s)".
   if (note) {
     if (name === "workflow") summary = summary.slice(1); // the note already says agents and time

@@ -62,6 +62,7 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter or Tab to select, 
 | `/loop [interval] <prompt>` | Repeat a prompt or `/command`: `/loop 5m check the deploy`, `/loop run the tests every 2h`. Without an interval the agent paces itself, choosing each delay (1 minute – 1 hour) or ending the loop when its job is done. `/loop` shows status, `/loop stop` ends it. |
 | `/workflow <name> [args]` | Run a saved multi-agent workflow (see [Subagents and workflows](#subagents-and-workflows)). `/workflow new <name>` creates one from a template. |
 | `/workflows` | List saved workflows. |
+| `/verbose [on\|off]` | Show what the model is thinking: its reasoning streams into the transcript as dimmed `∴` blocks, each subagent's tool calls are listed, and tool results show up to 40 lines. Ctrl+O toggles. Remembered between runs. |
 | `/agents` | Show every agent of the last turn (main agent, subagents, workflow agents): status, time, tool uses, and input/output/reasoning tokens. |
 | `/resume` | Pick up a previous chat from the current folder. `/resume 2` or `/resume <id>` jumps straight to one. |
 | `/sessions` | Browse saved chats from every folder: resume one, or press `d` to delete it. |
@@ -112,6 +113,12 @@ reported by the server, or estimated from streamed thinking). States are
 color-coded: thinking, writing, running a tool, waiting for approval,
 reconnecting, done, failed. Columns drop out on narrow terminals. `/agents`
 prints the same table for the last turn after it ends.
+
+**Verbose.** By default, thinking is summarised as `✻ Thought for 12s` and
+tool output as a short preview. `/verbose` (or Ctrl+O, even mid-turn) shows the
+reasoning itself as it streams, every tool call a subagent makes
+(`↳ Review api: Read(src/api.ts)`), what each thinking subagent is weighing in
+the agents panel, and up to 40 lines of each tool result.
 
 Every turn ends with a line saying what happened: `✻ Worked for 1m 12s · 9 tool
 calls · ↓ 3.4k tokens`, or why it stopped. A turn never ends silently.
@@ -329,6 +336,7 @@ command. Use `/auto` only when you want those actions to run without prompts.
 | Esc | Close menus. While a turn is running, press Esc **twice** to stop it (the first press arms it, so a stray Esc won't kill a long run). This also stops subagents, workflows and retry waits. |
 | y / a / n | Answer a permission prompt: allow once, allow that tool for the session, decline |
 | Ctrl+T | Expand or collapse the live agents view |
+| Ctrl+O | Toggle verbose: thinking, subagent steps and full tool output |
 | Ctrl+C | Stops the response while one is streaming. Otherwise clears the input; press it twice to exit. |
 | Ctrl+D | Exit |
 
@@ -369,7 +377,7 @@ UNJAILED_BASE_URL=http://localhost:8787/v1 UNJAILED_HOME=./.dev node dist/index.
 npm test          # unit + integration tests against the mock
 ```
 
-Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:emoji`, `mock:flaky`, `mock:batch`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
+Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:emoji`, `mock:flaky`, `mock:batch`, `mock:think`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
 
 The CLI continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
 

@@ -163,7 +163,8 @@ function stateText(t: AgentStat): string {
   if (t.status === "queued") return theme.dim("queued");
   const st = t.state ?? "waiting";
   // A tool title says more than "running"; thinking/writing speak for themselves.
-  const word = (st === "tool" || st === "retrying" || st === "approval") && t.detail ? t.detail : STATE_WORD[st];
+  // A thinking subagent's detail is its latest thought (verbose only).
+  const word = (st === "tool" || st === "retrying" || st === "approval" || (st === "thinking" && t.detail?.startsWith("∴"))) && t.detail ? t.detail : STATE_WORD[st];
   return PHASE_TONE[st](word);
 }
 

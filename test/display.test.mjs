@@ -134,3 +134,14 @@ test("emoji with disputed widths are normalized so table and box borders stay al
   const box = rows.filter((l) => /^[╭│╰]/.test(l));
   assert.equal(new Set(box.map((l) => stringWidth(l))).size, 1, "box borders align");
 });
+
+test("verbose tool summaries show up to 40 lines of output", () => {
+  const out = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n");
+  assert.equal(toolSummary("run_command", {}, true, out).length, 5, "compact: 4 lines + more marker");
+  const v = toolSummary("run_command", {}, true, out, 100, true);
+  assert.equal(v.length, 41);
+  assert.equal(v.at(-1), "… +20 lines");
+  assert.deepEqual(toolSummary("read_file", {}, true, "a\nb"), ["Read 2 lines"]);
+  assert.deepEqual(toolSummary("read_file", {}, true, "a\nb", 100, true), ["Read 2 lines", "a", "b"]);
+  assert.deepEqual(toolSummary("grep", {}, true, "(no matches)", 100, true), ["No matches"]);
+});

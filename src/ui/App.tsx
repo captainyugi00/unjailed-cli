@@ -22,7 +22,7 @@ import { createSkill, loadSkills, projectSkillsDir, skillsSystemPrompt, userSkil
 import { agentSystemPrompt } from "../system-prompt.js";
 import { DEFAULT_MODEL } from "../constants.js";
 import { renderMarkdown } from "../markdown.js";
-import { theme, tone } from "../theme.js";
+import { c, theme, tone } from "../theme.js";
 import { Header } from "./Header.js";
 import { FinishFlourish } from "./Snow.js";
 import { fxEnabled } from "./fx.js";
@@ -64,7 +64,8 @@ type Item =
   | { id: number; kind: "header"; model: string; loggedIn: boolean; keySource: KeySource }
   | { id: number; kind: "user"; text: string }
   | { id: number; kind: "assistant"; text: string; first: boolean }
-  | { id: number; kind: "tool"; name: string; args: string; ok: boolean; output: string; note?: string }
+  | { id: number; kind: "tool"; name: string; args: string; ok: boolean; output: string; note?: string; verbose?: boolean }
+  | { id: number; kind: "thinking"; text: string }
   | { id: number; kind: "turn"; text: string; tone: Tone }
   | { id: number; kind: "info" | "success" | "error" | "warn" | "plain"; text: string };
 
@@ -93,6 +94,8 @@ interface Stream {
   text: string;
   hiddenCharacters: number;
   flushed: boolean;
+  /** Verbose: the thinking paragraph being streamed right now. */
+  thinking?: string;
 }
 
 /** What waits to run when the current turn ends. */
@@ -180,6 +183,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   // recent request (= current context size). approx when the server sent none.
   const [usage, setUsage] = useState<{ ctx: number; prompt: number; completion: number; approx: boolean } | null>(null);
   const [fx, setFx] = useState<boolean>(() => fxEnabled());
+  /** /verbose: show thinking, subagent steps and full tool output. A ref too,
+   *  so toggling mid-turn takes effect inside the running turn. */
+  const [verbose, setVerboseState] = useState<boolean>(() => readConfig().verbose === true);
+  const verboseRef = useRef(verbose);
+  const setVerbose = (on: boolean) => {
+    verboseRef.current = on;
+    setVerboseState(on);
+    writeConfig({ verbose: on });
+  };
   const [approval, setApproval] = useState<Approval | null>(null);
   const [goal, setGoalState] = useState<Goal | null>(null);
   const [loop, setLoopState] = useState<LoopState | null>(null);
@@ -484,8 +496,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           flushedAny = true;
         }
       }
+      if (verboseRef.current) flushThinking(false);
       const preview = displayBuffer.preview();
-      setStream({ text: preview.text, hiddenCharacters: preview.hiddenCharacters, flushed: flushedAny });
+      setStream({ text: preview.text, hiddenCharacters: preview.hiddenCharacters, flushed: flushedAny, thinking: verboseRef.current ? thinkingText : undefined });
     };
     const schedule = () => {
       if (!timer) timer = setTimeout(sync, 80);
@@ -500,11 +513,27 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       flushedAny = false; // the next prose block after a tool gets its own bullet
       setStream(null);
     };
+    // Verbose: thinking streams into the transcript paragraph by paragraph.
+    let thinkingText = "";
+    let thinkingShown = false;
+    const flushThinking = (all: boolean) => {
+      const cut = all ? thinkingText.length : thinkingText.lastIndexOf("\n\n");
+      if (cut <= 0) return;
+      const done = thinkingText.slice(0, cut).trim();
+      thinkingText = thinkingText.slice(cut).replace(/^\n+/, "");
+      if (done) {
+        push({ kind: "thinking", text: done });
+        thinkingShown = true;
+      }
+    };
     const endThinking = () => {
+      flushThinking(true);
+      thinkingText = "";
       if (!thinkingSince) return;
       const secs = (Date.now() - thinkingSince) / 1000;
       thinkingSince = 0;
-      if (secs >= 2) push({ kind: "info", text: `✻ Thought for ${formatElapsed(secs * 1000)}` });
+      if (secs >= 2) push({ kind: "info", text: `✻ Thought for ${formatElapsed(secs * 1000)}${verboseRef.current ? "" : " · /verbose shows the thinking"}` });
+      thinkingShown = false;
     };
 
     setStream({ text: "", hiddenCharacters: 0, flushed: false });
@@ -541,6 +570,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         streamedChars += t.length;
         reasoningChars += t.length;
         refreshTokens();
+        if (verboseRef.current) {
+          thinkingText += t;
+          schedule();
+        }
       },
       onUsage: (u) => {
         gotUsage = true;
@@ -580,7 +613,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       onToolResult: (name, ok, output, callId) => {
         const call = pendingCalls.get(callId);
         pendingCalls.delete(callId);
-        push({ kind: "tool", name, args: call ?? "{}", ok, output, note: callNotes.get(callId) });
+        push({ kind: "tool", name, args: call ?? "{}", ok, output, note: callNotes.get(callId), verbose: verboseRef.current });
         callNotes.delete(callId);
         // Finished subagent groups leave the live panel once reported.
         live.current.groups = live.current.groups.filter((g) => g.tasks.some((t) => t.status === "running" || t.status === "queued"));
@@ -638,9 +671,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             return r;
           },
           describeCall: (name, args) => toolTitle(name, parseArgs(args), 50).replace(/\x1b\[[0-9;]*m/g, ""),
+          onTool: (name, args) => {
+            if (verboseRef.current) push({ kind: "info", text: `↳ ${task.label}: ${toolTitle(name, parseArgs(args), Math.max(30, size.columns - task.label.length - 10))}` });
+          },
           onActivity: (a) => {
             task.state = a.state;
-            task.detail = a.detail;
+            // Verbose shows what a thinking subagent is thinking about.
+            task.detail = a.state === "thinking" && verboseRef.current && a.thought ? `∴ ${a.thought.trim()}` : a.detail;
             task.tokensIn = a.tokensIn;
             task.tokens = a.tokens;
             task.reasoning = a.reasoning;
@@ -1316,6 +1353,16 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     push({ kind: "plain", text: [theme.bold("Workflows"), ...list.map((x) => `${theme.brand(x.name.padEnd(w))}${x.description || theme.dim("(no description)")}${x.scope === "project" ? theme.dim("  · this project") : ""}`), "", theme.dim("/workflow <name> [json args] runs one")].join("\n") });
   };
 
+  // ---------- /verbose ----------
+
+  const verboseCommand = (arg: string) => {
+    const a = arg.toLowerCase();
+    const next = a === "on" ? true : a === "off" ? false : !verboseRef.current;
+    setVerbose(next);
+    if (next) success("Verbose on — the model's thinking, each subagent step and full tool output appear in the transcript. Ctrl+O toggles.");
+    else info("Verbose off — thinking is summarised as \"Thought for …\" and tool output is previewed.");
+  };
+
   // ---------- /agents ----------
 
   const agentsCommand = () => {
@@ -1397,6 +1444,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         return workflowsCommand();
       case "agents":
         return agentsCommand();
+      case "verbose":
+        return verboseCommand(cmd.arg);
       case "fun":
         return funCommand(cmd.arg);
       case "api":
@@ -1851,6 +1900,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       setAgentsExpanded((v) => !v);
       return;
     }
+    if (key.ctrl && input === "o") {
+      verboseCommand("");
+      return;
+    }
     if (key.ctrl && input === "c") {
       if (abortRef.current) {
         abortRef.current.abort();
@@ -2036,6 +2089,12 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
       {fx && <FinishFlourish streaming={turnActive} />}
 
+      {stream?.thinking?.trim() ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Thinking text={stream.thinking} width={width} maxLines={Math.max(2, Math.min(8, Math.floor(liveRows / 2)))} />
+        </Box>
+      ) : null}
+
       {stream && stream.text.trim() ? (
         <Box flexDirection="column" marginTop={1}>
           <AssistantText text={stream.text} first={!stream.flushed} maxLines={Math.max(1, liveRows)} width={width} hiddenCharacters={stream.hiddenCharacters} />
@@ -2176,7 +2235,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         </Box>
       )}
 
-      <Footer width={width} model={model} effort={effort} skills={activeSkills.length} toolsMode={toolsMode} autoMode={autoMode} planMode={planMode} loggedIn={!!auth.key} flash={turnActive ? null : flash} queued={queueLen} ctx={usage ? { tokens: usage.ctx, approx: usage.approx } : null} goal={goal} loop={loop} />
+      <Footer width={width} model={model} effort={effort} skills={activeSkills.length} toolsMode={toolsMode} autoMode={autoMode} planMode={planMode} loggedIn={!!auth.key} flash={turnActive ? null : flash} queued={queueLen} ctx={usage ? { tokens: usage.ctx, approx: usage.approx } : null} goal={goal} loop={loop} verbose={verbose} />
     </>
   );
 }
@@ -2246,7 +2305,8 @@ function ApprovalBox({ approval, width }: { approval: Approval; width: number })
 
 /** The line under the input: model and modes on the left, context on the right.
  *  Parts drop out by priority as the terminal narrows. */
-function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, loggedIn, flash, queued, ctx, goal, loop }: {
+function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, loggedIn, flash, queued, ctx, goal, loop, verbose }: {
+  verbose: boolean;
   width: number; model: string; effort: Effort; skills: number; toolsMode: "off" | "read" | "cmds" | "yolo"; autoMode: "ask" | "auto"; planMode: "off" | "on"; loggedIn: boolean; flash: string | null; queued: number; ctx: { tokens: number; approx: boolean } | null; goal: Goal | null; loop: LoopState | null;
 }) {
   const [, setTick] = useState(0);
@@ -2263,6 +2323,7 @@ function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, l
   if (autoMode === "auto" && toolsMode !== "yolo") parts.push([tone.failed("auto-approve"), 6]);
   if (planMode === "on" && (toolsMode === "cmds" || toolsMode === "yolo")) parts.push([theme.dim("plan"), 3]);
   if (effort !== "auto") parts.push([theme.dim(`effort ${effort}`), 2]);
+  if (verbose) parts.push([tone.thinking("verbose"), 5]);
   if (skills) parts.push([theme.dim(`${skills} skill${skills === 1 ? "" : "s"}`), 2]);
   if (goal) parts.push([tone.goal(`◎ goal ${goal.turns}/${goal.maxTurns}`), 8]);
   if (loop) parts.push([tone.agent(`↻ loop${loop.nextAt ? ` ${formatDuration(Math.max(0, loop.nextAt - Date.now()))}` : loop.lastReason === "paused" ? " paused" : " running"}`), 8]);
@@ -2400,7 +2461,13 @@ function TranscriptItem({ item, width, gap }: { item: Item; width: number; gap: 
     case "tool":
       return (
         <Box marginTop={top} width={width}>
-          <Text>{formatToolBlock(item.name, item.args, item.ok, item.output, width, item.note)}</Text>
+          <Text>{formatToolBlock(item.name, item.args, item.ok, item.output, width, item.note, item.verbose)}</Text>
+        </Box>
+      );
+    case "thinking":
+      return (
+        <Box marginTop={top}>
+          <Thinking text={item.text} width={width} />
         </Box>
       );
     case "turn": {
@@ -2428,6 +2495,31 @@ function TranscriptItem({ item, width, gap }: { item: Item; width: number; gap: 
   }
 }
 
+/** The model's thinking: dim italics under a ∴ gutter. While streaming,
+ *  only the last `maxLines` rows are shown. */
+function Thinking({ text, width, maxLines }: { text: string; width: number; maxLines?: number }) {
+  const cols = Math.max(10, width - 2);
+  let body = sanitizeForDisplay(text).trim();
+  if (maxLines) {
+    const lines = body.split("\n").flatMap((l) => {
+      const out: string[] = [];
+      for (let i = 0; i < Math.max(1, l.length); i += cols - 1) out.push(l.slice(i, i + cols - 1));
+      return out;
+    });
+    body = (lines.length > maxLines ? "… " : "") + lines.slice(-maxLines).join("\n");
+  }
+  return (
+    <Box flexDirection="row">
+      <Box width={2} flexShrink={0}>
+        <Text>{tone.thinking("∴")}</Text>
+      </Box>
+      <Box width={cols}>
+        <Text>{tone.thinking(c.italic(body))}</Text>
+      </Box>
+    </Box>
+  );
+}
+
 /** An icon column plus text that wraps under itself, not under the icon. */
 function Note({ top, width, icon, text }: { top: number; width: number; icon: string; text: string }) {
   return (
@@ -2452,6 +2544,7 @@ function helpText(): string {
     ["Space", "Toggle a skill in /skills"],
     ["y / a / n", "Answer a permission prompt: yes · yes for the session · no"],
     ["Ctrl+T", "Expand or collapse the live agents view"],
+    ["Ctrl+O", "Verbose: show thinking, subagent steps and full tool output"],
     ["Esc", "Close menus · while working, press twice to stop"],
     ["Ctrl+C", "Stop the response · clear input · press twice to exit"],
     ["Ctrl+D", "Exit"],

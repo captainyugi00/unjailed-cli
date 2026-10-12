@@ -27,6 +27,7 @@
 //   "mock:emoji"    a reply full of emoji with variation selectors (layout drift)
 //   "mock:flaky"    every agent's first request reports "The model stream was interrupted"
 //   "mock:batch"    three tool calls in one reply (type a message while the first runs)
+//   "mock:think"    the agent and a subagent stream visible reasoning (try /verbose)
 //   "mock:pace"     self-paced loop: schedule_next 60s on the first run, stop:true afterwards
 
 import http from "node:http";
@@ -163,6 +164,10 @@ function agentScenario(body) {
     const key = `flaky:${/You are a subagent/.test(system) ? lastUser : "main"}`;
     if (bump(key) === 1) return /You are a subagent/.test(system) ? { streamError: INTERRUPTED } : { text: "Starting the work, ", streamError: INTERRUPTED };
   }
+  if (/You are a subagent/.test(system) && /mock-think/.test(lastUser)) {
+    if (!toolsSince.length) return { reasoning: "I am the subagent and I am weighing which file to open first, calc.py looks right.", text: "", toolCalls: [call("read_file", { path: "calc.py" })] };
+    return { reasoning: "The file is two lines long.", text: "calc.py defines add(a, b)." };
+  }
   if (/You are a subagent/.test(system)) {
     if (/json verdict/.test(lastUser)) return { text: "```json\n{\"ok\": true, \"count\": 2}\n```" };
     if (!toolsSince.length) return { text: "Looking around first.", toolCalls: [call("list_dir", { path: "." })] };
@@ -176,6 +181,10 @@ function agentScenario(body) {
     if (round === 1) return { text: "Found it: `add` subtracts. Fixing:", toolCalls: [call("edit_file", { path: "calc.py", old_text: "    return a-b", new_text: "    return a+b" })] };
     if (round === 2) return { text: "Verifying.", toolCalls: [call("run_command", { command: "python3 -c 'import calc; print(calc.add(2,3))'" })] };
     return { text: "Fixed `calc.py:2` — `add(2, 3)` now prints **5**.\n\n| File | Change |\n|---|---|\n| calc.py | `a-b` → `a+b` |" };
+  }
+  if (/mock:think/.test(firstUser)) {
+    if (round === 0) return { reasoning: "The user wants a look at this folder. First I should list the files.\n\nThen I can delegate a closer read to a subagent.", text: "Looking around.", toolCalls: [call("list_dir", { path: "." }), call("agent", { description: "Deep read", prompt: "mock-think read calc.py closely" })] };
+    return { reasoning: "Both results are in; the folder is small and the subagent confirmed it.", text: "The folder holds calc.py and nothing else." };
   }
   if (/mock:batch/.test(firstUser)) {
     // One reply with three tool calls; the first takes a second, leaving time to type.
@@ -248,6 +257,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       const chunk = (delta, finish = null) => res.write(`data: ${JSON.stringify({ id: "mock", object: "chat.completion.chunk", model: body.model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`);
       await sleep(250);
+      for (const t of tokens(scenario.reasoning ?? "")) { chunk({ reasoning_content: t }); await sleep(25); }
       for (const t of tokens(scenario.text ?? "")) { chunk({ content: t }); await sleep(12); }
       if (scenario.streamError) {
         res.write(`data: ${JSON.stringify({ error: { message: scenario.streamError, type: "server_error" } })}\n\n`);

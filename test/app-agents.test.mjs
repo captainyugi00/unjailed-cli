@@ -218,3 +218,33 @@ test("a message sent while a batch of tools runs is delivered after the current 
     assert.match(out, /Re-planned with your message/);
   } finally { ui.unmount(); }
 });
+
+test("/verbose shows the model's thinking, subagent steps and full tool output; off keeps it compact", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false, verbose: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:think quiet");
+    await waitFor(ui, /The folder holds calc\.py/, "compact turn ends");
+    await waitFor(ui, /Worked for/, "compact summary");
+    let out = all(ui);
+    assert.doesNotMatch(out, /First I should list the files/, "thinking hidden when verbose is off");
+    assert.doesNotMatch(out, /↳ Deep read/, "subagent steps hidden");
+    const before = ui.frames.length;
+    await type(ui, "/verbose");
+    await waitFor(ui, /Verbose on/, "verbose on");
+    await type(ui, "mock:think loud");
+    await waitFor(ui, /∴ The user wants a look at this folder\. First I should list the files\./, "main agent thinking in the transcript");
+    await waitFor(ui, /↳ Deep read: Read\(calc\.py\)/, "subagent step in the transcript");
+    await waitFor(ui, /Worked for[\s\S]*Worked for/, "verbose turn ends");
+    out = ui.frames.slice(before).join("\n");
+    assert.match(out, /∴ Both results are in/, "thinking after the tools too");
+    assert.match(out, /Listed \d+ entr(y|ies)\n\s+\S/, "full tool output under the summary");
+    await waitFor(ui, /◆ glm-5\.3[^\n]*verbose/, "footer shows verbose");
+    const { readConfig } = await import("../dist/config.js");
+    assert.equal(readConfig().verbose, true, "remembered");
+    ui.stdin.write("\u000f"); // Ctrl+O
+    await waitFor(ui, /Verbose off/, "Ctrl+O toggles");
+    assert.equal(readConfig().verbose, false);
+  } finally { ui.unmount(); writeConfig({ verbose: false }); }
+});

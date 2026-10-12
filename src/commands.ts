@@ -18,6 +18,7 @@ export const COMMANDS: CommandSpec[] = [
   { name: "loop", description: "Repeat a prompt or /command on an interval, or self-paced", args: "[interval] <prompt>|stop" },
   { name: "workflow", description: "Run a saved multi-agent workflow, or create one", args: "<name> [args]|new <name>" },
   { name: "workflows", description: "List saved multi-agent workflows" },
+  { name: "verbose", description: "Show the model's thinking, subagent steps and full tool output (Ctrl+O)", args: "[on|off]" },
   { name: "agents", description: "Agents of the last turn: status, time, tools, input/output/reasoning tokens" },
   { name: "fun", description: "Toggle the fun effects (startup wink, side snow, sparkles)", args: "[on|off]" },
   { name: "api", description: "Show API endpoint, key and connection status" },

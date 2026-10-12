@@ -65,6 +65,8 @@ export interface SubagentActivity {
   /** Reasoning tokens: reported by the server, else estimated from streamed thinking. */
   reasoning: number;
   toolCalls: number;
+  /** The end of the subagent's current thinking, for verbose views. */
+  thought?: string;
 }
 
 export interface SubagentRun {
@@ -79,6 +81,8 @@ export interface SubagentRun {
   signal: AbortSignal;
   execute: (name: string, args: Record<string, unknown>, id: string) => Promise<{ ok: boolean; output: string }>;
   describeCall?: (name: string, args: string) => string;
+  /** Each tool call the subagent makes (for verbose transcripts). */
+  onTool?: (name: string, args: string) => void;
   onActivity?: (a: SubagentActivity) => void;
   onRetry?: (info: RetryInfo) => void;
   /** Retry pacing (tests use a fast one). */
@@ -114,7 +118,12 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
   const handlers: AgentHandlers = {
     onRequest: () => emit("waiting"),
     onToken: (t) => { streamedChars += t.length; emit(act.state === "writing" ? undefined : "writing"); },
-    onReasoning: (t) => { streamedChars += t.length; reasoningChars += t.length; emit(act.state === "thinking" ? undefined : "thinking"); },
+    onReasoning: (t) => {
+      streamedChars += t.length;
+      reasoningChars += t.length;
+      act.thought = ((act.thought ?? "") + t).replace(/\s+/g, " ").slice(-160);
+      emit(act.state === "thinking" ? undefined : "thinking");
+    },
     onUsage: (u) => {
       act.tokensIn += u.prompt;
       completion += u.completion;
@@ -124,7 +133,12 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
       streamedChars = 0;
       emit();
     },
-    onToolCall: (name, args) => { act.toolCalls++; emit("tool", run.describeCall ? run.describeCall(name, args) : name); },
+    onToolCall: (name, args) => {
+      act.toolCalls++;
+      act.thought = undefined;
+      run.onTool?.(name, args);
+      emit("tool", run.describeCall ? run.describeCall(name, args) : name);
+    },
     onRetry: (info) => { emit("retrying", info.reason); run.onRetry?.(info); },
   };
   const res = await agentTurn(run.baseUrl, run.key, run.model, history, handlers, run.signal, {
