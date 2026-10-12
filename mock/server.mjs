@@ -24,6 +24,7 @@
 //   "mock:outage"   the first two requests fail with 503; the CLI should retry and recover
 //   "mock:ansi"     runs a command whose output has colors, tabs and carriage returns
 //   "mock:tick"     answers "tick N" (for /loop)
+//   "mock:emoji"    a reply full of emoji with variation selectors (layout drift)
 //   "mock:pace"     self-paced loop: schedule_next 60s on the first run, stop:true afterwards
 
 import http from "node:http";
@@ -99,6 +100,28 @@ const counters = new Map();
 const bump = (k) => { const n = (counters.get(k) ?? 0) + 1; counters.set(k, n); return n; };
 const call = (name, args, id = `call_${name}_${Math.random().toString(36).slice(2, 8)}`) => ({ id, name, args: JSON.stringify(args) });
 
+// Emoji with and without variation selectors, in prose, lists, tables and code:
+// the shapes models use that drift terminal layouts.
+const EMOJI_REPLY = [
+  "## Status ⚠️ report",
+  "",
+  "| Check | Result | Note |",
+  "|---|---|---|",
+  "| Build | ✅ pass | ✔️ clean |",
+  "| Lint | ⚠️ warn | ❤️ 3 issues |",
+  "| Tests | ❌ fail | ☑️ retry |",
+  "",
+  "- ✔️ done item with a long tail of text that has to wrap across the terminal width at least once or twice",
+  "- ⚠️ warning item",
+  "",
+  "```text",
+  "⚠️ boxed warning line",
+  "✅ boxed ok line",
+  "```",
+  "",
+  "Done ✔️.",
+].join("\n");
+
 const WORKFLOW_SCRIPT = `export const meta = { name: "mock-review", description: "Two reviewers in parallel, then a JSON verdict", phases: [{ title: "Review" }, { title: "Verdict" }] };
 phase("Review");
 const reports = await parallel(["alpha", "beta"].map((area) => () => agent("mock-sub review area " + area, { label: "review " + area, phase: "Review" })));
@@ -119,7 +142,11 @@ function agentScenario(body) {
   const typed = msgs.filter((m) => m.role === "user" && !internal.test(String(m.content)));
   const goalPrompt = msgs.filter((m) => m.role === "user" && /^\[goal\]/.test(String(m.content))).at(-1)?.content;
   const firstUser = String(goalPrompt && /mock:/.test(goalPrompt) && !/mock:/.test(String(typed.at(-1)?.content ?? "")) ? goalPrompt : typed.at(-1)?.content ?? lastUser);
-  const toolsSince = msgs.slice(lastUserIdx + 1).filter((m) => m.role === "tool");
+  // Rounds count from the last message the person typed; mid-task messages
+  // and the CLI's own follow-ups don't restart a scenario.
+  const internalMsg = /^(\[goal\]|\[Sent by the user|Your previous reply was cut off|You hit the output limit|You described a next step|Continue now)/;
+  const typedIdx = msgs.map((m, i) => (m.role === "user" && !internalMsg.test(String(m.content)) ? i : -1)).filter((i) => i >= 0).at(-1) ?? lastUserIdx;
+  const toolsSince = msgs.slice((/You are a subagent/.test(system) ? lastUserIdx : typedIdx) + 1).filter((m) => m.role === "tool");
   const allText = msgs.map((m) => m.content ?? "").join("\n");
 
   if (/strict goal evaluator/i.test(system)) {
@@ -175,6 +202,7 @@ function agentScenario(body) {
     return { text: "Stopping the loop." };
   }
   if (/mock:tick/.test(firstUser)) return { text: `tick ${bump("tick")}` };
+  if (/mock:emoji/.test(firstUser)) return { text: EMOJI_REPLY };
   return null;
 }
 

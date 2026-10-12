@@ -1780,9 +1780,42 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     // keys keep waiting. Input in the first 150ms after arming is dropped
     // (the submit-Enter echo on Windows terminals).
     if (approvalAnswerRef.current) {
-      const answer = approvalAnswer(input ?? "", key, Date.now() - approvalArmedAt.current);
-      if (answer !== undefined) approvalAnswerRef.current(answer);
-      if (key.ctrl && input === "c") abortRef.current?.abort();
+      const armedFor = Date.now() - approvalArmedAt.current;
+      if (key.ctrl && input === "c") {
+        approvalAnswerRef.current(false);
+        abortRef.current?.abort();
+        return;
+      }
+      // With an empty input, y/a/n (1/2/3) and Esc answer the prompt.
+      if (!editor.value) {
+        const answer = approvalAnswer(input ?? "", key, armedFor);
+        if (answer !== undefined) {
+          approvalAnswerRef.current(answer);
+          return;
+        }
+      } else if (key.escape) {
+        approvalAnswerRef.current(false);
+        return;
+      }
+      // Anything else is the start of a message: keep it as a draft instead
+      // of dropping it. Once a draft exists, every key goes to the draft, so
+      // typing can never answer the prompt by accident. Enter sends the draft
+      // to the agent (delivered at its next step); the prompt stays open.
+      if (armedFor < 150 || key.ctrl || key.meta || key.tab || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow) return;
+      if (key.return) {
+        if (editor.value.trim()) submitChat(editor.value);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        const value = editor.value.slice(0, -1);
+        setEditor({ value, cursor: value.length });
+        return;
+      }
+      const text = (input ?? "").replace(/[\x00-\x1f\x7f]/g, "");
+      if (text) {
+        const value = editor.value + text;
+        setEditor({ value, cursor: value.length });
+      }
       return;
     }
     // plan approval: arrow-select Start/Cancel, Enter confirms, Esc = cancel
@@ -2206,6 +2239,7 @@ function ApprovalBox({ approval, width }: { approval: Approval; width: number })
       <Text wrap="truncate-end">
         {theme.ok("y")} yes   {theme.brand("a")} yes, and don't ask again for {tool} this session   {theme.err("n")} no {theme.dim("(esc)")}
       </Text>
+      <Text wrap="truncate-end">{theme.dim("Type anything else to write the agent a message; Enter sends it.")}</Text>
     </Box>
   );
 }

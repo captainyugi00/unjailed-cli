@@ -159,3 +159,30 @@ test("commands queued during a turn don't strand the messages queued after them"
     await waitFor(ui, /You said: "second message"[\s\S]*Worked for/, "the message behind it ran too", 30_000);
   } finally { ui.unmount(); writeConfig({ effort: "auto" }); }
 });
+
+test("text typed while a permission prompt is open becomes a message, never an answer", async () => {
+  writeConfig({ tools: "cmds", plan: false, autoMode: "ask", fx: false });
+  fs.writeFileSync(path.join(work, "calc.py"), "def add(a,b):\n    return a-b\n");
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:edit fix calc");
+    await waitFor(ui, /Permission needed[\s\S]*Update\(calc\.py\)/, "edit approval");
+    await sleep(200);
+    // Starts with "k": a draft. The "y" inside it must not approve anything.
+    ui.stdin.write("keep it short, yes");
+    await sleep(80);
+    assert.equal(fs.readFileSync(path.join(work, "calc.py"), "utf8").includes("a+b"), false, "nothing approved by typing");
+    assert.match(ui.lastFrame(), /keep it short, yes/, "the draft is visible in the input");
+    ui.stdin.write("\r");
+    await waitFor(ui, /Sent to the agent/, "draft sent as a mid-task message");
+    await sleep(200);
+    ui.stdin.write("y");
+    await waitFor(ui, /Delivered to the agent mid-turn/, "delivered after the approved step");
+    await waitFor(ui, /Permission needed[\s\S]*Bash\(/, "next approval");
+    await sleep(200);
+    ui.stdin.write("n");
+    await waitFor(ui, /Worked for/, "turn end");
+    assert.match(fs.readFileSync(path.join(work, "calc.py"), "utf8"), /a\+b/);
+  } finally { ui.unmount(); }
+});

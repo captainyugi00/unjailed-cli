@@ -119,3 +119,18 @@ test("the agents table shows status, time, tools and in/out/reasoning tokens, an
   assert.match(taskLine(rows[1], 72_000, "◐", 100), /◐ Review api\s+Read\(src\/api\.ts\)\s+32s · ↑8\.2k ↓1\.2k/);
   assert.ok(stringWidth(taskLine(rows[1], 72_000, "◐", 40)) <= 40);
 });
+
+test("emoji with disputed widths are normalized so table and box borders stay aligned", () => {
+  assert.equal(sanitizeForDisplay("⚠️ warn ✔️ ok"), "⚠ warn ✔ ok", "presentation selectors removed");
+  assert.equal(sanitizeForDisplay("👨‍👩‍👧 family"), "👨👩👧 family", "joined sequences split into measurable parts");
+  assert.equal(sanitizeForDisplay("✅ ❌ 😀"), "✅ ❌ 😀", "default-emoji characters are untouched");
+  const out = renderMarkdown("| A | B |\n|---|---|\n| ⚠️ x | ✔️ y |\n| ok | 👨‍👩‍👧 z |\n\n```\n⚠️ boxed\nplain\n```", { width: 60 });
+  assert.doesNotMatch(out, /[️‍]/);
+  const rows = out.split("\n");
+  // Every row of the table puts its separator in the same column…
+  const seps = rows.filter((l) => l.includes("│") && !l.includes("╭") && !/^\s*│ /.test(l)).map((l) => stringWidth(l.slice(0, l.indexOf("│"))));
+  assert.equal(new Set(seps).size, 1, `table separators align: ${seps}`);
+  // …and every box row has the same width.
+  const box = rows.filter((l) => /^[╭│╰]/.test(l));
+  assert.equal(new Set(box.map((l) => stringWidth(l))).size, 1, "box borders align");
+});

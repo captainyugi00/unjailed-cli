@@ -122,7 +122,8 @@ it mid-task. Commands and plain-chat messages queue and run when the turn ends.
 
 **Permission prompts** show the exact command, file content or diff. Press `y`
 to allow it once, `a` to allow that tool for the rest of the session, or `n`/Esc
-to decline.
+to decline. Typing anything else starts a message to the agent instead (it is
+never taken as an answer), and Enter sends it.
 
 ## Reliability
 
@@ -140,9 +141,10 @@ to decline.
   doesn't take it, it's prompted to carry on. Tool calls whose arguments were
   cut off are never executed. Instead, the agent is told to retry with smaller
   pieces.
-- **Clean output.** Colors, cursor movement, carriage-return progress bars and
-  tabs in command output or model replies are normalized before display, so
-  long sessions don't drift out of alignment. Layout adapts to the terminal
+- **Clean output.** Colors, cursor movement, carriage-return progress bars,
+  tabs, and emoji whose width terminals disagree on (`⚠️`, joined sequences
+  like `👨‍👩‍👧`) are normalized before display, so long sessions don't drift
+  out of alignment. Layout adapts to the terminal
   width and is reprinted on resize.
 
 ## Subagents and workflows
@@ -361,7 +363,7 @@ UNJAILED_BASE_URL=http://localhost:8787/v1 UNJAILED_HOME=./.dev node dist/index.
 npm test          # unit + integration tests against the mock
 ```
 
-Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
+Put `ratelimit`, `servererror`, `credit`, `slow`, `hang`, `reason`, `markdown`, `longcode` or `usage` in a chat message to make the mock server return that behavior. With tools on, the scripted agent scenarios `mock:edit`, `mock:agents`, `mock:workflow`, `mock:goal`, `mock:stall`, `mock:drop`, `mock:outage`, `mock:ansi`, `mock:emoji`, `mock:tick` and `mock:pace` exercise tool rounds, subagents, workflows, goals, recovery paths and loops (see the top of `mock/server.mjs`).
 
 The CLI continues when a model announces work without a tool call, with at most two recovery attempts and a clear failure message. It rejects incomplete tool arguments, preserves final streamed tool calls, supports line ranges in `read_file`, and preserves Windows CRLF and literal dollar characters in edits. Targeted edits and ranged reads support files up to 5 MB; individual full writes and replacements retain a 200 KB limit.
 
