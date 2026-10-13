@@ -406,3 +406,19 @@ test("a message sent mid-batch is delivered after the running tool; the rest of 
     assert.match(msgs.at(-1).content, /stop, use tabs instead/);
   });
 });
+
+test("repeated reasoning deadlines escalate (act now → low effort → longer deadline) instead of ending the turn", async () => {
+  const thinking = () => new Response(new ReadableStream({ start(c) { const t = setInterval(() => { try { c.enqueue(delta({ reasoning_content: "hmm " })); } catch { clearInterval(t); } }, 5); } }), { headers: { "content-type": "text/event-stream" } });
+  await withFetch([thinking, thinking, thinking, text("Finally acting.")], async (requests) => {
+    const r = await run([{ role: "user", content: "fix it" }], { reasoningTimeoutMs: 40, effort: "high" });
+    assert.equal(r.end, "done");
+    assert.match(r.streamed, /Finally acting/);
+    assert.deepEqual(requests.map((q) => q.reasoning_effort), ["high", "high", "low", "low"], "effort drops to low after the second deadline");
+    assert.match(r.notices.join("\n"), /\(1\/4\)[\s\S]*lowered to low[\s\S]*extended to/);
+  });
+  // Past the last recovery the turn ends with a clear message.
+  await withFetch(Array.from({ length: 6 }, () => thinking), async (requests) => {
+    await assert.rejects(run([{ role: "user", content: "fix it" }], { reasoningTimeoutMs: 20 }), /kept reasoning without answering, 5 times/);
+    assert.equal(requests.length, 5);
+  });
+});

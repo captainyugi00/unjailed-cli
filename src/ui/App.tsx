@@ -1638,7 +1638,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         quit();
         return;
       case "help":
-        push({ kind: "plain", text: helpText() });
+        push({ kind: "plain", text: helpText(size.columns - 4) });
         return;
       case "resume":
         return openSessions("folder", cmd.arg);
@@ -1763,17 +1763,26 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const planFirst = async (history: AgentMessage[], ctrl: AbortController): Promise<boolean> => {
     setPhase("thinking", "drafting a plan");
     let plan = "";
-    try {
-      await streamChatRetry(baseUrl, auth.key!, model, [
-        ...history.filter((m) => m.role !== "tool"),
-        { role: "user", content: "Before doing anything: reply with ONLY a short numbered plan (max 8 steps, one line each) for exactly this task. No prose before or after. You will not execute anything yet." },
-      ] as ChatMessage[], {
-        onToken: (t) => { plan += t; },
-      }, ctrl.signal, { effort });
-    } catch (err) {
-      if (err instanceof AbortedError) throw err;
-      info("Plan draft failed — no actions were taken. Retry or use /plan off.");
-      return false;
+    // A draft that only reasons past the deadline is retried once at low effort.
+    for (let attempt = 0; ; attempt++) {
+      plan = "";
+      try {
+        await streamChatRetry(baseUrl, auth.key!, model, [
+          ...history.filter((m) => m.role !== "tool"),
+          { role: "user", content: "Before doing anything: reply with ONLY a short numbered plan (max 8 steps, one line each) for exactly this task. No prose before or after. You will not execute anything yet." },
+        ] as ChatMessage[], {
+          onToken: (t) => { plan += t; },
+        }, ctrl.signal, { effort: attempt ? "low" : effort });
+        break;
+      } catch (err) {
+        if (err instanceof AbortedError) throw err;
+        if (attempt === 0 && err instanceof ApiError && err.code === "reasoning-deadline") {
+          warn("The plan draft reasoned past the deadline — retrying at low effort.");
+          continue;
+        }
+        info(`Plan draft failed (${friendly(err)}) — no actions were taken. Retry or use /plan off.`);
+        return false;
+      }
     }
     const trimmed = plan.trim();
     if (!trimmed || !/^\s*1[.)]/m.test(trimmed)) { info("No valid plan received — no actions were taken. Retry or use /plan off."); return false; }
@@ -1939,12 +1948,17 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     }
   };
 
+  const lastLoginAttempt = useRef(0);
   const submitLogin = async (value: string) => {
     const key = value.trim();
     if (!key) {
+      // A pasted key submits itself; the Enter people press after pasting
+      // must not report "no key entered" over the real result.
+      if (busy === "Checking key" || Date.now() - lastLoginAttempt.current < 2500) return;
       error("No key entered. Paste your API key, or press Esc to cancel.");
       return;
     }
+    lastLoginAttempt.current = Date.now();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     setBusy("Checking key");
@@ -2385,7 +2399,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
       {turnActive && (
         <Box marginTop={1}>
-          <ActivityBar read={() => live.current} width={width} hint={stopHint} expanded={agentsExpanded} stats={verbose ? () => sessionStats.current : undefined} maxTaskRows={Math.max(2, Math.min(agentsExpanded ? 16 : 8, size.rows - 14))} />
+          <ActivityBar read={() => live.current} width={width} hint={stopHint} flash={flash} expanded={agentsExpanded} stats={verbose ? () => sessionStats.current : undefined} maxTaskRows={Math.max(2, Math.min(agentsExpanded ? 16 : 8, size.rows - 14))} />
         </Box>
       )}
 
@@ -2418,7 +2432,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             items={mode.list.map((s, i) => ({
               key: s.id,
               label: `${String(i + 1).padStart(2)}. ${s.title}`,
-              hint: `${timeAgo(s.updated)} · ${s.count} msg${s.count === 1 ? "" : "s"}${mode.scope === "all" ? " · " + prettyPath(s.cwd) : ""}`,
+              hint: `${timeAgo(s.updated)} · ${s.count} msg${s.count === 1 ? "" : "s"}${mode.scope === "all" ? " · " + tailPath(prettyPath(s.cwd), 32) : ""}`,
               current: session.current?.id === s.id,
             }))}
             selected={mode.selected}
@@ -2794,9 +2808,35 @@ function Note({ top, width, icon, text }: { top: number; width: number; icon: st
   );
 }
 
-function helpText(): string {
-  const cmdW = Math.max(...COMMANDS.map((c) => `/${c.name}${c.args ? " " + c.args : ""}`.length)) + 3;
-  const cmds = COMMANDS.map((c) => `${theme.brand(`/${c.name}${c.args ? " " + c.args : ""}`.padEnd(cmdW))}${c.description}`);
+/** The end of a long path ("…/projects/app"): the folder name is the useful part. */
+function tailPath(p: string, max: number): string {
+  if (stringWidth(p) <= max) return p;
+  let out = "";
+  for (const ch of [...p].reverse()) {
+    if (stringWidth(out) + stringWidth(ch) > max - 1) break;
+    out = ch + out;
+  }
+  return "…" + out;
+}
+
+/** Two-column help that fits the terminal: the description wraps under its
+ *  own column, and on narrow screens it moves below the command. */
+function helpText(width = 100): string {
+  const rows = (pairs: [string, string][], color: (s: string) => string): string[] => {
+    const longest = Math.max(...pairs.map(([k]) => stringWidth(k)));
+    const keyW = Math.min(longest, 30) + 2;
+    const descW = width - keyW;
+    if (descW < 28) {
+      // Narrow: the key on its own line, the description indented below it.
+      return pairs.flatMap(([k, d]) => [color(k), ...wrapWords(d, Math.max(10, width - 4)).map((l) => "    " + l)]);
+    }
+    return pairs.flatMap(([k, d]) => {
+      const lines = wrapWords(d, descW);
+      if (stringWidth(k) > keyW - 2) return [color(k), ...lines.map((l) => " ".repeat(keyW) + l)];
+      return lines.map((l, i) => (i === 0 ? color(k) + " ".repeat(keyW - stringWidth(k)) : " ".repeat(keyW)) + l);
+    });
+  };
+  const cmds: [string, string][] = COMMANDS.map((c) => [`/${c.name}${c.args ? " " + c.args : ""}`, c.description]);
   const keys: [string, string][] = [
     ["Enter", "Send · while the agent works, messages reach it at its next step (queued if tools are off) and most /commands run at once"],
     ["Shift+Enter or \\ then Enter", "New line (Alt+Enter / Ctrl+J also work)"],
@@ -2813,12 +2853,20 @@ function helpText(): string {
     ["Ctrl+C", "Stop the response · close a picker · clear input · press twice to exit"],
     ["Ctrl+D", "Exit (when the input is empty and nothing is running)"],
   ];
-  const keyW = Math.max(...keys.map(([k]) => k.length)) + 3;
-  return [
-    theme.bold("Commands"),
-    ...cmds,
-    "",
-    theme.bold("Keys"),
-    ...keys.map(([k, d]) => theme.brand(k.padEnd(keyW)) + d),
-  ].join("\n");
+  return [theme.bold("Commands"), ...rows(cmds, theme.brand), "", theme.bold("Keys"), ...rows(keys, theme.brand)].join("\n");
+}
+
+/** Word-wrap plain text to `width` columns. */
+function wrapWords(text: string, width: number): string[] {
+  const out: string[] = [];
+  let line = "";
+  for (const word of text.split(/\s+/)) {
+    if (!word) continue;
+    if (line && stringWidth(line) + 1 + stringWidth(word) > width) {
+      out.push(line);
+      line = word;
+    } else line = line ? `${line} ${word}` : word;
+  }
+  if (line) out.push(line);
+  return out.length ? out : [""];
 }

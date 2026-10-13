@@ -342,7 +342,7 @@ export function agentsTable(rows: AgentStat[], width: number, now: number, frame
 
 /** `read` is polled on every animation frame, so fast-changing counters
  *  (tokens, the current tool) never force the whole app to re-render. */
-export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = false, stats }: { read: () => LiveView; width: number; hint: string; maxTaskRows?: number; expanded?: boolean; stats?: () => SessionStats }) {
+export function ActivityBar({ read, width, hint, flash, maxTaskRows = 8, expanded = false, stats }: { read: () => LiveView; width: number; hint: string; flash?: string | null; maxTaskRows?: number; expanded?: boolean; stats?: () => SessionStats }) {
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 120);
@@ -355,6 +355,9 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
   const subagents = groups.reduce((n, g) => n + g.tasks.length, 0);
   const toggle = width >= 90 ? `ctrl+t ${expanded ? "collapse" : "agents"}` : "";
   const fullHint = [hint, subagents || expanded ? toggle : ""].filter(Boolean).join(" · ");
+  // A confirmation like "Press Esc again to stop" must stay visible even when
+  // the status line is too narrow for its hint.
+  const flashRow = flash && !strip(statusLine(activity, now, frame, width, flash)).includes(strip(flash)) ? <Text wrap="truncate-end">{"  " + theme.warn(flash)}</Text> : null;
   const statRows = stats ? statsLines(read(), stats(), now, Math.max(20, width - 6)) : [];
   const statsBox = statRows.length ? (
     <Box flexDirection="column" marginTop={1}>
@@ -379,6 +382,7 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
     return (
       <Box flexDirection="column">
         <Text wrap="truncate-end">{statusLine(activity, now, frame, width, fullHint)}</Text>
+        {flashRow}
         {retryRow && <Text wrap="truncate-end">{"  " + retryRow}</Text>}
         <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} width={tableW}>
           <Text wrap="truncate-end">
@@ -417,6 +421,7 @@ export function ActivityBar({ read, width, hint, maxTaskRows = 8, expanded = fal
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end">{statusLine(activity, now, frame, width, fullHint)}</Text>
+      {flashRow}
       {rows.map((r, i) => (
         <Text key={i} wrap="truncate-end">
           {theme.dim(i === 0 ? "  ⎿  " : "     ")}

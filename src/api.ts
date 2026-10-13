@@ -545,6 +545,7 @@ export interface AgentTurnResult {
 }
 
 const MAX_EMPTY_CLOSES = 12; // ~8 minutes of backoff
+const MAX_DEADLINES = 4; // reasoning-deadline recoveries per turn
 const MAX_CUT_OFFS = 12; // with backoff, several minutes of an unstable upstream
 const CONTINUE_CUT_OFF = "Your previous reply was cut off before it finished. Continue exactly where it stopped. Do not repeat text you already wrote.";
 const CONTINUE_LENGTH = "You hit the output limit mid-reply. Continue exactly where you stopped. Do not repeat text you already wrote. Split large files into several smaller edits.";
@@ -590,6 +591,9 @@ export async function agentTurn(
   const maxRounds = options.maxRounds ?? 100;
   const delayFor = options.backoff ?? backoffMs;
   let deadlines = 0; // reasoning-deadline recoveries
+  // Escalation after a deadline: act now → lower effort → longer deadline.
+  let effortNow = options.effort;
+  let deadlineMs = options.reasoningTimeoutMs;
   const hasTools = !!options.tools?.length && !!options.execute;
   let recoveries = 0; // length / reasoning-only resumes
   let emptyCloses = 0; // streams closed before any output, in a row
@@ -616,14 +620,27 @@ export async function agentTurn(
       res = await streamChatRetry(baseUrl, key, model, history as ChatMessage[], {
         ...handlers,
         onToken: (t) => { roundText += t; handlers.onToken(t); },
-      }, signal, { effort: options.effort, tools: hasTools ? options.tools : undefined, backoff: options.backoff, reasoningTimeoutMs: options.reasoningTimeoutMs });
+      }, signal, { effort: effortNow, tools: hasTools ? options.tools : undefined, backoff: options.backoff, reasoningTimeoutMs: deadlineMs });
     } catch (err) {
-      // A model that only deliberates past the deadline is asked to act now,
-      // rather than ending the turn.
-      if (err instanceof ApiError && err.code === "reasoning-deadline" && deadlines++ < 2) {
+      // A model that only deliberates past the deadline doesn't end the turn:
+      // it is asked to act, then its effort is lowered, then it gets longer.
+      if (err instanceof ApiError && err.code === "reasoning-deadline" && deadlines < MAX_DEADLINES) {
+        deadlines++;
         answer += roundText;
-        resume(roundText, CONTINUE_REASONING, "The model reasoned past the deadline without acting — asking it to proceed.");
+        let note = `The model reasoned past the deadline without acting — asking it to proceed (${deadlines}/${MAX_DEADLINES}).`;
+        if (deadlines >= 2 && effortNow !== "low") {
+          effortNow = "low";
+          note += " Reasoning effort lowered to low for this turn.";
+        }
+        if (deadlines >= 3) {
+          deadlineMs = (deadlineMs ?? REASONING_TIMEOUT_MS) * 2;
+          note += ` Deadline extended to ${Math.round(deadlineMs / 1000)}s.`;
+        }
+        resume(roundText, CONTINUE_REASONING, note);
         continue;
+      }
+      if (err instanceof ApiError && err.code === "reasoning-deadline") {
+        throw new ApiError(`The model kept reasoning without answering, ${MAX_DEADLINES + 1} times in a row (effort lowered, deadline extended). Completed work is saved; send "continue" or try another /model.`, undefined, undefined, true, { code: "reasoning-deadline" });
       }
       throw err;
     }

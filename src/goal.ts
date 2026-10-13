@@ -1,4 +1,5 @@
-import { streamChatRetry, type ChatMessage } from "./api.js";
+import { ApiError, streamChatRetry, type ChatMessage } from "./api.js";
+import { REASONING_TIMEOUT_MS } from "./constants.js";
 import type { ToolEvent } from "./context.js";
 
 /**
@@ -97,7 +98,17 @@ export async function evaluateGoal(
     { role: "user", content: `GOAL:\n${goal.condition}\n\nEVIDENCE:\n${evidence}` },
   ];
   let text = "";
-  await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; } }, signal, { effort: "low" });
+  // A check that only reasons past the deadline is retried once with a longer one.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      text = "";
+      await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; } }, signal, { effort: "low", reasoningTimeoutMs: attempt ? REASONING_TIMEOUT_MS * 2 : undefined });
+      break;
+    } catch (err) {
+      if (attempt === 0 && err instanceof ApiError && err.code === "reasoning-deadline") continue;
+      throw err;
+    }
+  }
   return parseVerdict(text) ?? { met: false, reason: "The evaluator's reply was unreadable; continuing to be safe" };
 }
 

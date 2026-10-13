@@ -2,7 +2,7 @@ import React, { useRef } from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import { theme } from "../theme.js";
 import stringWidth from "string-width";
-import { editorViewport } from "./stream-buffer.js";
+import { editorViewport, TAB_CELLS } from "./stream-buffer.js";
 
 export interface EditorState {
   value: string;
@@ -49,7 +49,7 @@ function visualRows(value: string, columns: number): Array<{ start: number; end:
       start = offset + 1;
       cells = 0;
     } else {
-      const size = stringWidth(ch);
+      const size = ch === "\t" ? TAB_CELLS : stringWidth(ch);
       if (cells + size > width) {
         rows.push({ start, end: offset });
         start = offset;
@@ -83,12 +83,13 @@ export function moveVisual(s: EditorState, columns: number, dir: -1 | 1): Editor
   const at = rowOf(rows, s.cursor);
   const target = at + dir;
   if (target < 0 || target >= rows.length) return s;
-  const col = stringWidth(s.value.slice(rows[at]!.start, s.cursor));
+  const cellsOf = (t: string) => stringWidth(t.replace(/\t/g, " ".repeat(TAB_CELLS)));
+  const col = cellsOf(s.value.slice(rows[at]!.start, s.cursor));
   const row = rows[target]!;
   let cursor = row.start;
   let cells = 0;
   for (const ch of s.value.slice(row.start, row.end)) {
-    const size = stringWidth(ch);
+    const size = ch === "\t" ? TAB_CELLS : stringWidth(ch);
     if (cells + size > col) break;
     cells += size;
     cursor += ch.length;
@@ -238,7 +239,12 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
   );
 }
 
-function renderWithCursor(value: string, cursor: number, active: boolean, placeholder?: string): string {
+function renderWithCursor(raw: string, rawCursor: number, active: boolean, placeholder?: string): string {
+  // Tabs stay in the draft but are drawn as spaces: a raw tab would move the
+  // terminal cursor and push the box border out of place.
+  const tabs = raw.slice(0, rawCursor).split("\t").length - 1;
+  const value = raw.replace(/\t/g, " ".repeat(TAB_CELLS));
+  const cursor = rawCursor + tabs * (TAB_CELLS - 1);
   const inv = (ch: string) => `\x1b[7m${ch}\x1b[27m`;
   if (!value) {
     const ph = placeholder ? theme.dim(placeholder) : "";
