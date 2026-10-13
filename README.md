@@ -180,9 +180,10 @@ never taken as an answer), and Enter sends it.
   drafts. The status line shows a countdown. Esc Esc stops waiting. Invalid
   keys, missing credit, over-long context and malformed requests stop at once
   with a clear message. A model that only deliberates past the reasoning
-  deadline (180 s, `UNJAILED_REASONING_TIMEOUT`) is asked to act instead, up to
-  twice per turn. A stream silent for `UNJAILED_TIMEOUT` seconds (default 120)
-  counts as stalled.
+  deadline (180 s, twice that at `high` effort; `UNJAILED_REASONING_TIMEOUT`)
+  is asked to act and given a doubled deadline each time, up to four times per
+  turn. Your effort setting is never changed. A stream silent for
+  `UNJAILED_TIMEOUT` seconds (default 120) counts as stalled.
 - **Cut-off replies are resumed.** If a stream ends early or the connection
   drops mid-reply, the agent continues from where it stopped instead of
   starting over, and you see a note saying so. Repeated interruptions wait a

@@ -595,9 +595,11 @@ export async function agentTurn(
   const maxRounds = options.maxRounds ?? 100;
   const delayFor = options.backoff ?? backoffMs;
   let deadlines = 0; // reasoning-deadline recoveries
-  // Escalation after a deadline: act now → lower effort → longer deadline.
-  let effortNow = options.effort;
-  let deadlineMs = options.reasoningTimeoutMs;
+  // After a deadline: ask the model to act and give it more time. The
+  // effort the user chose is never changed. High effort starts with a
+  // longer deadline, because long thinking is expected there.
+  const effortNow = options.effort;
+  let deadlineMs = options.reasoningTimeoutMs ?? (options.effort === "high" ? REASONING_TIMEOUT_MS * 2 : undefined);
   const hasTools = !!options.tools?.length && !!options.execute;
   let recoveries = 0; // length / reasoning-only resumes
   let emptyCloses = 0; // streams closed before any output, in a row
@@ -627,24 +629,17 @@ export async function agentTurn(
       }, signal, { effort: effortNow, tools: hasTools ? options.tools : undefined, backoff: options.backoff, reasoningTimeoutMs: deadlineMs });
     } catch (err) {
       // A model that only deliberates past the deadline doesn't end the turn:
-      // it is asked to act, then its effort is lowered, then it gets longer.
+      // it is asked to act and given a longer deadline; the effort stays as chosen.
       if (err instanceof ApiError && err.code === "reasoning-deadline" && deadlines < MAX_DEADLINES) {
         deadlines++;
         answer += roundText;
-        let note = `The model reasoned past the deadline without acting — asking it to proceed (${deadlines}/${MAX_DEADLINES}).`;
-        if (deadlines >= 2 && effortNow !== "low") {
-          effortNow = "low";
-          note += " Reasoning effort lowered to low for this turn.";
-        }
-        if (deadlines >= 3) {
-          deadlineMs = (deadlineMs ?? REASONING_TIMEOUT_MS) * 2;
-          note += ` Deadline extended to ${Math.round(deadlineMs / 1000)}s.`;
-        }
-        resume(roundText, CONTINUE_REASONING, note);
+        const waited = Math.round((deadlineMs ?? REASONING_TIMEOUT_MS) / 1000);
+        deadlineMs = (deadlineMs ?? REASONING_TIMEOUT_MS) * 2;
+        resume(roundText, CONTINUE_REASONING, `Still reasoning after ${waited}s without an answer — asking it to act (${deadlines}/${MAX_DEADLINES}). Deadline extended to ${Math.round(deadlineMs / 1000)}s; your effort setting is unchanged.`);
         continue;
       }
       if (err instanceof ApiError && err.code === "reasoning-deadline") {
-        throw new ApiError(`The model kept reasoning without answering, ${MAX_DEADLINES + 1} times in a row (effort lowered, deadline extended). Completed work is saved; send "continue" or try another /model.`, undefined, undefined, true, { code: "reasoning-deadline" });
+        throw new ApiError(`The model kept reasoning without answering, ${MAX_DEADLINES + 1} times in a row, even with the deadline doubled each time. Completed work is saved; send "continue", raise UNJAILED_REASONING_TIMEOUT, or try another /model.`, undefined, undefined, true, { code: "reasoning-deadline" });
       }
       throw err;
     }

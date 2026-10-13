@@ -1945,13 +1945,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         ] as ChatMessage[], {
           onToken: (t) => { plan += t; },
           onUsage,
-        }, ctrl.signal, { effort: attempt ? "low" : effort, reasoningTimeoutMs: attempt >= 2 ? REASONING_TIMEOUT_MS * 2 : undefined });
+        }, ctrl.signal, { effort, reasoningTimeoutMs: REASONING_TIMEOUT_MS * (effort === "high" ? 2 : 1) * 2 ** attempt });
         break;
       } catch (err) {
         if (err instanceof AbortedError) throw err;
-        // Escalate like a normal turn: low effort, then a longer deadline.
+        // Like a normal turn: more time, never a different effort.
         if (attempt < 2 && err instanceof ApiError && err.code === "reasoning-deadline") {
-          warn(attempt === 0 ? "The plan draft reasoned past the deadline — retrying at low effort." : "Still no plan — retrying with a longer deadline.");
+          warn("The plan draft is still reasoning — retrying with a longer deadline (your effort setting is unchanged).");
           continue;
         }
         if (err instanceof ApiError && err.code === "reasoning-deadline") {
