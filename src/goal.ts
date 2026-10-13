@@ -98,14 +98,16 @@ export async function evaluateGoal(
     { role: "user", content: `GOAL:\n${goal.condition}\n\nEVIDENCE:\n${evidence}` },
   ];
   let text = "";
-  // A check that only reasons past the deadline is retried once with a longer one.
+  // A check that only reasons past the deadline is retried with a longer one
+  // (×2, then ×4) before the goal is paused.
   for (let attempt = 0; ; attempt++) {
     try {
       text = "";
-      await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; } }, signal, { effort: "low", reasoningTimeoutMs: attempt ? REASONING_TIMEOUT_MS * 2 : undefined });
+      await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; } }, signal, { effort: "low", reasoningTimeoutMs: attempt ? REASONING_TIMEOUT_MS * 2 ** attempt : undefined });
       break;
     } catch (err) {
-      if (attempt === 0 && err instanceof ApiError && err.code === "reasoning-deadline") continue;
+      if (attempt < 2 && err instanceof ApiError && err.code === "reasoning-deadline") continue;
+      if (err instanceof ApiError && err.code === "reasoning-deadline") throw new ApiError("The goal check kept reasoning without answering (3 tries, deadline extended each time).", undefined, undefined, true, { code: "reasoning-deadline" });
       throw err;
     }
   }

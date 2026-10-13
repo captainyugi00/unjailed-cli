@@ -20,7 +20,7 @@ import { currentVersion, latestVersion, runSelfUpdate } from "../updater.js";
 import { recoverAuth, tryClearEnvKeyWindows } from "../auth-recovery.js";
 import { createSkill, loadSkills, projectSkillsDir, skillsSystemPrompt, userSkillsDir, type Skill } from "../skills.js";
 import { agentSystemPrompt } from "../system-prompt.js";
-import { DEFAULT_MODEL } from "../constants.js";
+import { DEFAULT_MODEL, REASONING_TIMEOUT_MS } from "../constants.js";
 import { renderMarkdown } from "../markdown.js";
 import { theme, tone } from "../theme.js";
 import { Header } from "./Header.js";
@@ -1824,13 +1824,18 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           { role: "user", content: "Before doing anything: reply with ONLY a short numbered plan (max 8 steps, one line each) for exactly this task. No prose before or after. You will not execute anything yet." },
         ] as ChatMessage[], {
           onToken: (t) => { plan += t; },
-        }, ctrl.signal, { effort: attempt ? "low" : effort });
+        }, ctrl.signal, { effort: attempt ? "low" : effort, reasoningTimeoutMs: attempt >= 2 ? REASONING_TIMEOUT_MS * 2 : undefined });
         break;
       } catch (err) {
         if (err instanceof AbortedError) throw err;
-        if (attempt === 0 && err instanceof ApiError && err.code === "reasoning-deadline") {
-          warn("The plan draft reasoned past the deadline — retrying at low effort.");
+        // Escalate like a normal turn: low effort, then a longer deadline.
+        if (attempt < 2 && err instanceof ApiError && err.code === "reasoning-deadline") {
+          warn(attempt === 0 ? "The plan draft reasoned past the deadline — retrying at low effort." : "Still no plan — retrying with a longer deadline.");
           continue;
+        }
+        if (err instanceof ApiError && err.code === "reasoning-deadline") {
+          info("The model couldn't draft a plan in time (3 tries) — no actions were taken. Send the task again, try another /model, or /plan off.");
+          return false;
         }
         info(`Plan draft failed (${friendly(err)}) — no actions were taken. Retry or use /plan off.`);
         return false;
