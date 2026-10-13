@@ -83,7 +83,8 @@ async function httpError(res: Response): Promise<ApiError> {
       return new ApiError(`Rate limited.${msg ? " " + msg : hint}`, res.status, after);
     }
     default:
-      if (res.status >= 500) return new ApiError(`The server had a problem (HTTP ${res.status})${msg ? `: ${msg}` : "."}`, res.status);
+      // 501/505 never change on retry, nor does a 5xx that says the request itself is wrong.
+      if (res.status >= 500) return new ApiError(`The server had a problem (HTTP ${res.status})${msg ? `: ${msg}` : "."}`, res.status, undefined, res.status === 501 || res.status === 505 || (!!msg && PERMANENT_SERVER_ERROR.test(msg) && !RETRY_HINT.test(msg)));
       // Some gateways answer an upstream interruption with a 4xx; trust the message.
       return new ApiError(msg ? `Request failed: ${msg}` : `Request failed (HTTP ${res.status}).`, res.status, undefined, false, { retryable: !!msg && RETRY_HINT.test(msg) && !PERMANENT_SERVER_ERROR.test(msg) });
   }
@@ -534,7 +535,7 @@ export interface AgentHandlers extends StreamHandlers {
 }
 
 /** Why an agent turn ended — always reported to the user, never silent. */
-export type TurnEnd = "done" | "max-rounds" | "gave-up";
+export type TurnEnd = "done" | "max-rounds" | "gave-up" | "interrupted";
 
 export interface AgentTurnResult {
   /** The reply since the last tool round (continuations included). */
@@ -646,6 +647,13 @@ export async function agentTurn(
     }
     answer += roundText;
 
+    // A stream cut off while tool calls were arriving: their arguments may be
+    // partial (or still empty). Never run them; resume the reply instead.
+    if (res.incomplete && res.toolCalls.length) {
+      if (++cutOffs > MAX_CUT_OFFS) return { text: answer, end: "interrupted", rounds: round + 1, toolCalls };
+      resume(roundText, CONTINUE_CUT_OFF, "The connection dropped while the model was calling a tool — nothing ran; asking it to continue.");
+      continue;
+    }
     if (res.incomplete && !res.toolCalls.length) {
       if (!roundText.trim()) {
         // Closed before a single token: usually an outage. Wait it out, but a
@@ -658,7 +666,7 @@ export async function agentTurn(
         continue;
       }
       emptyCloses = 0;
-      if (++cutOffs > MAX_CUT_OFFS) return { text: answer, end: "gave-up", rounds: round + 1, toolCalls };
+      if (++cutOffs > MAX_CUT_OFFS) return { text: answer, end: "interrupted", rounds: round + 1, toolCalls };
       resume(roundText, CONTINUE_CUT_OFF, "The reply was interrupted — resuming where it stopped.");
       // Repeated interruptions usually mean an unstable upstream: wait a bit longer each time.
       if (cutOffs > 1) {
@@ -809,7 +817,7 @@ export function prepareRequestHistory(history: AgentMessage[]): { messages: Agen
       const copy = { ...m };
       return isWorkingContext(m) ? protectWorkingContext(copy) : copy;
     }
-    const calls = m.tool_calls.filter((call) => resultIds.has(call.id));
+    const calls = m.tool_calls.filter((call) => resultIds.has(call.id)).map(compactCall);
     return calls.length ? { ...m, tool_calls: calls } : { role: "assistant", content: m.content };
   });
   trimHistory(messages, 84_000);
@@ -823,6 +831,21 @@ export function prepareRequestHistory(history: AgentMessage[]): { messages: Agen
     messages.splice(position, 0, { role: "assistant", content: archive });
   }
   return { messages, trimmed };
+}
+
+/** A finished call's arguments are resent with every later request. A big
+ *  write (say 60 KB of file content) would exceed upstream string limits and
+ *  the budget, so long string values are replaced by a short note: the call
+ *  already ran and its result follows. */
+const MAX_ARG_CHARS = 2_000;
+function compactCall(call: { id: string; type: "function"; function: { name: string; arguments: string } }) {
+  if (call.function.arguments.length <= MAX_ARG_CHARS) return call;
+  let args: unknown;
+  try { args = JSON.parse(call.function.arguments); } catch { return { ...call, function: { ...call.function, arguments: "{}" } }; }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return { ...call, function: { ...call.function, arguments: "{}" } };
+  const short = Object.fromEntries(Object.entries(args as Record<string, unknown>).map(([k, v]) =>
+    typeof v === "string" && v.length > 400 ? [k, `${v.slice(0, 200)}…[${v.length - 200} more characters already sent; this call has run, see its result]`] : [k, v]));
+  return { ...call, function: { ...call.function, arguments: JSON.stringify(short) } };
 }
 
 /** Approx wire size of a message (content + any tool_calls payload). */

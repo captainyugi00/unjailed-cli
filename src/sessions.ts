@@ -350,7 +350,9 @@ async function appendLocked(session: Session): Promise<string> {
     catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
     if (meta?.format === 2 && meta.revision !== session.revision) throw new Error("Session revision changed in another terminal; refusing to overwrite its history or pinned notes.");
     let cursor = cursors.get(file);
-    if (cursor && meta && (meta.format !== 2 || meta.messageCount !== cursor.messages || meta.toolCount !== cursor.tools)) cursor = undefined;
+    // No manifest means the chat was deleted (e.g. in another terminal):
+    // start a fresh journal from message 0 instead of appending to nothing.
+    if (cursor && (!meta || meta.format !== 2 || meta.messageCount !== cursor.messages || meta.toolCount !== cursor.tools)) cursor = undefined;
     if (!cursor) {
       let oldMessages: ChatMessage[] = [], oldTools: ToolEvent[] = [];
       if (meta?.format === 2) {

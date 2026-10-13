@@ -48,8 +48,8 @@ export async function runLocalCommand(command: string, cwd: string, options: {
   let stopped: string | undefined;
   let settled = false;
   let timer: NodeJS.Timeout | undefined;
-  const append = (data: Buffer) => {
-    output = (output + data.toString()).slice(-OUTPUT_LIMIT);
+  const append = (data: string) => {
+    output = (output + data).slice(-OUTPUT_LIMIT);
     if (job) {
       job.output = output;
       // Bound disk usage too; servers can otherwise fill a drive overnight.
@@ -63,6 +63,10 @@ export async function runLocalCommand(command: string, cwd: string, options: {
       }
     }
   };
+  // Decode each stream as a whole: a multi-byte character split across two
+  // chunks would otherwise turn into "��".
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
   child.stdout?.on("data", append);
   child.stderr?.on("data", append);
   return new Promise((resolve) => {

@@ -311,7 +311,7 @@ The toolkit:
 | `read_file` | Read a file (whole files up to 200 KB; larger ones up to 5 MB in sections with `start_line`/`max_lines`) |
 | `list_dir` | List a directory (up to 500 entries) |
 | `glob` | Find files by name pattern (`**/*.ts`), up to 200 results |
-| `grep` | Search file contents, regex, file:line results (up to 100) |
+| `grep` | Search file contents, regex, file:line results (up to 100); text files up to 5 MB are searched and any larger ones are listed as skipped |
 | `open_url` | Open an http/https URL in your default browser (cmds/yolo) |
 | `clipboard` | Read clipboard; writes require cmds/yolo |
 | `launch_app` | Open an app or file with the OS (cmds/yolo) |
@@ -332,7 +332,7 @@ Commands run through `cmd /d /s /c` on Windows and `/bin/sh -c` elsewhere.
 `run_command` accepts `cwd` so the agent can build and run projects anywhere your
 OS account can access, including folders with spaces. All filesystem tools and
 command directories support `~/` and the `Desktop`, `Documents`, `Downloads`,
-`Pictures`, `Videos` and `Music` shortcuts. This is ordinary local-user access; OS permissions still apply.
+`Pictures`, `Videos` and `Music` shortcuts. This is ordinary local-user access; OS permissions still apply. A shortcut only applies when the current folder has no folder of that name, so a project's own `desktop/` or `documents/` folder is used as-is.
 
 In `/tools cmds`, file writes/edits/moves/deletes, clipboard writes, app launches
 and commands require your approval. `/tools read` enforces read-only tools even

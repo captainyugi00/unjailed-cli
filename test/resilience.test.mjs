@@ -285,7 +285,7 @@ test("endless cut-off replies end the turn with a reason instead of looping", as
   const script = Array.from({ length: 14 }, (_, i) => stream([delta({ content: `part ${i} ` })], "close"));
   await withFetch(script, async (requests) => {
     const r = await run([{ role: "user", content: "q" }]);
-    assert.equal(r.end, "gave-up");
+    assert.equal(r.end, "interrupted");
     assert.equal(requests.length, 13, "12 resumes (with backoff), then a visible stop");
     assert.ok(r.retries.length >= 10, "repeated interruptions back off");
   });

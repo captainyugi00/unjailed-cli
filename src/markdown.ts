@@ -20,9 +20,13 @@ function inline(text: string): string {
     return `\u0000${codes.length - 1}\u0000`;
   });
   s = s.replace(HTML_TAG, ""); // drop leaked html outside code spans
-  s = s.replace(/\*\*([^*\n]+?)\*\*/g, (_, t: string) => c.bold(t));
-  s = s.replace(/__([^_\n]+?)__/g, (_, t: string) => c.bold(t));
-  s = s.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\*)/g, (_, pre: string, t: string) => pre + c.italic(t));
+  // Emphasis follows CommonMark's flanking rules closely enough for terminals:
+  // the text inside must not start or end with a space, and underscores must
+  // not touch a word on the outside, so __dirname, __init__.py and 2 * 3 * 4
+  // stay as written.
+  s = s.replace(/\*\*(?=\S)([^*\n]*?\S)\*\*/g, (_, t: string) => c.bold(t));
+  s = s.replace(/(^|[^\w])__(?=\S)([^_\n]*?\S)__(?!\w|\.\w)/g, (_, pre: string, t: string) => pre + c.bold(t));
+  s = s.replace(/(^|[^*\w])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?![*\w])/g, (_, pre: string, t: string) => pre + c.italic(t));
   s = s.replace(/~~([^~\n]+?)~~/g, (_, t: string) => c.strikethrough(t));
   s = s.replace(/\[([^\]\n]+)\]\((https?:[^)\s]+)\)/g, (_, label: string, url: string) => `${c.hex(BRAND_BLUE).underline(label)} ${c.gray(`(${url})`)}`);
   // inline code renders as a subtle chip; stays verbatim in no-color mode

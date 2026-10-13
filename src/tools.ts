@@ -275,8 +275,11 @@ export function resolveToolPath(p: string, cwd: string, platform: NodeJS.Platfor
   const firstSeg = parts[0] ?? "";
   const names: Record<string, string> = { desktop: "Desktop", documents: "Documents", downloads: "Downloads", pictures: "Pictures", videos: "Videos", music: "Music" };
   const folder = names[firstSeg.toLowerCase()];
-  if (folder) return paths.resolve(home, folder, ...parts.slice(1));
-  return paths.resolve(cwd, p);
+  const local = paths.resolve(cwd, p);
+  // "Desktop/x" means the user's Desktop only when the project has no such
+  // folder: a repo's own desktop/ or documents/ must never be redirected.
+  if (folder && !paths.isAbsolute(p) && !fs.existsSync(paths.resolve(cwd, firstSeg))) return paths.resolve(home, folder, ...parts.slice(1));
+  return local;
 }
 
 function clip(s: string, max = MAX_RUN_OUTPUT): string {
@@ -317,7 +320,8 @@ function globToRe(glob: string): RegExp {
         if (glob[j] === "}") { depth--; if (depth === 0) break; }
         body += glob[j]; j++;
       }
-      re += `(?:${body.split(",").map(escapeRe).join("|")})`;
+      // Each alternative is a glob of its own: {*.ts,*.tsx} works.
+      re += `(?:${body.split(",").map((alt) => globToRe(alt).source.slice(1, -1)).join("|")})`;
       i = j; i++;
       continue;
     } else re += escapeRe(c);
@@ -452,7 +456,10 @@ export async function executeTool(
     if (options.signal?.aborted) return { ok: false, output: "Tool cancelled before execution." };
     const readOnly = ["read_file", "list_dir", "glob", "grep", "web_fetch", "process_status"].includes(name) ||
       (name === "clipboard" && (args.action === undefined || args.action === "read"));
-    if (!readOnly && mode !== "yolo" && !options.autoApprove) {
+    // Carriage returns, escape sequences and other control characters can make
+    // an action look different from what runs: always ask, even in yolo/auto.
+    const disguised = !readOnly && Object.values(args).some((v) => typeof v === "string" && /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(v.replace(/\t/g, "")) && !(name === "write_file" || name === "edit_file"));
+    if (!readOnly && ((mode !== "yolo" && !options.autoApprove) || disguised)) {
       const action = `${name} ${JSON.stringify(args)}`;
       if (!approve || !(await approve(action))) return { ok: false, output: "The user declined or approval is unavailable. Nothing executed." };
     }
@@ -518,6 +525,7 @@ export async function executeTool(
       try { re = new RegExp(pattern); } catch (e) { return { ok: false, output: `Invalid regex: ${(e as Error).message}` }; }
       const onlyGlob = args.glob ? globToRe(String(args.glob)) : null;
       const results: string[] = [];
+      const skipped: string[] = [];
       const stat = fs.statSync(root);
       const files: string[] = stat.isFile() ? [root] : [...grepWalk(root)];
       for (const file of files) {
@@ -529,13 +537,17 @@ export async function executeTool(
         }
         let buf: Buffer;
         try { buf = fs.readFileSync(file); } catch { continue; }
-        if (buf.byteLength > MAX_READ_BYTES || looksBinary(buf)) continue;
+        if (looksBinary(buf)) continue;
+        // Large text files are searched too (up to the edit limit), and anything
+        // skipped is reported: "(no matches)" must mean nothing matched.
+        if (buf.byteLength > MAX_EDIT_FILE_BYTES) { skipped.push(path.relative(cwd, file)); continue; }
         const lines = buf.toString("utf8").split("\n");
         for (let n = 0; n < lines.length && results.length < MAX_GREP_RESULTS; n++) {
           if (re.test(lines[n]!)) results.push(`${path.relative(cwd, file)}:${n + 1}: ${lines[n]!.trim().slice(0, 200)}`);
         }
       }
-      return { ok: true, output: results.length ? results.join("\n") : "(no matches)" };
+      const note = skipped.length ? `\n(skipped ${skipped.length} file${skipped.length === 1 ? "" : "s"} over ${MAX_EDIT_FILE_BYTES / 1_000_000} MB: ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? ", …" : ""})` : "";
+      return { ok: true, output: (results.length ? results.join("\n") : "(no matches)") + note };
     }
 
     if (name === "clipboard") {
@@ -657,7 +669,11 @@ export async function executeTool(
       const file = resolveToolPath(p, cwd);
       if (fs.statSync(file).size > MAX_EDIT_FILE_BYTES) return { ok: false, output: `File exceeds ${MAX_EDIT_FILE_BYTES} bytes; nothing written.` };
       if (Buffer.byteLength(newText) > MAX_WRITE_BYTES) return { ok: false, output: "Replacement exceeds the write limit; nothing written." };
-      const src = fs.readFileSync(file, "utf8");
+      const raw = fs.readFileSync(file);
+      const src = raw.toString("utf8");
+      // Re-encoding must give the same bytes; otherwise the file isn't UTF-8
+      // and writing it back would replace every non-UTF-8 byte with "�".
+      if (!Buffer.from(src, "utf8").equals(raw)) return { ok: false, output: `${p} is not UTF-8 text (e.g. Latin-1 or UTF-16); editing it here would corrupt it. Nothing written. Use run_command with a tool that keeps its encoding.` };
       // Only tolerate LF/CRLF differences, never guessed whitespace or fuzzy anchors.
       const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       let pattern = new RegExp(escape(oldText), "g");

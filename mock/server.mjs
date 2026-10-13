@@ -151,8 +151,11 @@ function agentScenario(body) {
   // follow-ups (resume/nudge/goal prompts) belong to the same scenario.
   const internal = /^(\[goal\]|\[Sent by the user|Your previous reply was cut off|You hit the output limit|You described a next step|Continue now)/;
   const typed = msgs.filter((m) => m.role === "user" && !internal.test(String(m.content)));
-  const goalPrompt = msgs.filter((m) => m.role === "user" && /^\[goal\]/.test(String(m.content))).at(-1)?.content;
-  const firstUser = String(goalPrompt && /mock:/.test(goalPrompt) && !/mock:/.test(String(typed.at(-1)?.content ?? "")) ? goalPrompt : typed.at(-1)?.content ?? lastUser);
+  // A goal prompt newer than the last typed message decides the scenario.
+  const goalIdx = msgs.map((m, i) => (m.role === "user" && /^\[goal\]/.test(String(m.content)) ? i : -1)).filter((i) => i >= 0).at(-1) ?? -1;
+  const lastTypedIdx = msgs.map((m, i) => (m.role === "user" && !internal.test(String(m.content)) ? i : -1)).filter((i) => i >= 0).at(-1) ?? -1;
+  const goalPrompt = goalIdx >= 0 ? String(msgs[goalIdx].content) : "";
+  const firstUser = String(goalIdx > lastTypedIdx && /mock:/.test(goalPrompt) ? goalPrompt : typed.at(-1)?.content ?? lastUser);
   // Rounds count from the last message the person typed; mid-task messages
   // and the CLI's own follow-ups don't restart a scenario.
   const internalMsg = /^(\[goal\]|\[Sent by the user|Your previous reply was cut off|You hit the output limit|You described a next step|Continue now)/;

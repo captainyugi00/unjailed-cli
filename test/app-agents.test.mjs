@@ -342,3 +342,70 @@ test("/resume replays the chat as it was shown: thinking, subagent steps, tool b
     for (const piece of order) { const i = out.indexOf(piece, at + 1); assert.ok(i > at, `"${piece}" restored in order`); at = i; }
   } finally { again.unmount(); writeConfig({ verbose: false }); }
 });
+
+test("Ctrl+C in a picker opened mid-turn closes the picker and leaves the agent running", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:batch go");
+    await waitFor(ui, /Bash\(sleep 1/, "turn running");
+    await type(ui, "/effort");
+    await waitFor(ui, /Reasoning effort/, "picker open");
+    ui.stdin.write("\x03"); await sleep(150);
+    assert.doesNotMatch(ui.lastFrame(), /Reasoning effort/, "picker closed");
+    await waitFor(ui, /Worked for/, "the turn still finished normally", 15_000);
+    assert.doesNotMatch(all(ui), /Stopped by you/);
+  } finally { ui.unmount(); }
+});
+
+test("a goal set mid-turn starts once, and nothing extra runs after it is met", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:batch go");
+    await waitFor(ui, /Bash\(sleep 1/, "turn running");
+    await type(ui, "/goal mock:goal finish it");
+    await waitFor(ui, /Goal met/, "goal met", 30_000);
+    await sleep(1500);
+    const out = all(ui);
+    const after = out.slice(out.lastIndexOf("Goal met"));
+    assert.doesNotMatch(after, /Working on it|Waiting for model/, "no leftover goal turn after it was met");
+    assert.doesNotMatch(ui.lastFrame(), /queued/, "nothing left in the queue");
+  } finally { ui.unmount(); }
+});
+
+test("a rejected plan ends the turn cleanly and isn't resumed later as an interrupted run", async () => {
+  writeConfig({ tools: "cmds", plan: true, fx: false, autoMode: "ask" });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "mock:edit plan check");
+    await waitFor(ui, /Start this plan\?|Plan draft failed|No valid plan/, "plan stage", 15_000);
+    await sleep(200);
+    ui.stdin.write("n");
+    await waitFor(ui, /Plan not approved — nothing ran|No valid plan|Plan draft failed/, "turn ends", 10_000);
+  } finally { ui.unmount(); writeConfig({ plan: false }); }
+  await sleep(300);
+  const again = render(React.createElement(App, { startup: "continue" }));
+  try {
+    await waitFor(again, /Resumed/, "resumed");
+    assert.doesNotMatch(all(again), /interrupted mid-run|Continue where you left off/);
+  } finally { again.unmount(); }
+});
+
+test("↑ history keeps working past a recalled slash command", async () => {
+  writeConfig({ tools: "off", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "first prompt here");
+    await waitFor(ui, /You said: "first prompt here"[\s\S]*Worked for/, "first turn");
+    await type(ui, "/context");
+    await sleep(200);
+    ui.stdin.write("\x1b[A"); await sleep(100); // recalls /context
+    ui.stdin.write("\x1b[A"); await sleep(100); // must reach the older prompt, not move a menu
+    assert.match(ui.lastFrame(), /› first prompt here/);
+  } finally { ui.unmount(); }
+});

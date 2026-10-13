@@ -33,7 +33,7 @@ import { useTerminalSize } from "./useTerminalSize.js";
 import { StreamDisplayBuffer, retainDisplayWindow, streamingRowBudget } from "./stream-buffer.js";
 import { ActivityBar, addTurnToSession, agentsTable, emptySessionStats, emptyTurnStats, formatElapsed, formatTokens, statsLines, type AgentStat, type LiveView, type Phase, type SessionStats, type Task, type TaskGroup } from "./ActivityBar.js";
 import { clip, describeAction, formatToolBlock, parseArgs, toolKind, toolSummary, toolTitle } from "./tool-format.js";
-import { sanitizeForDisplay } from "./sanitize.js";
+import { revealForApproval, sanitizeForDisplay } from "./sanitize.js";
 import { Thinking } from "./Thinking.js";
 import {
   deleteSession,
@@ -374,8 +374,13 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const approvalBody = (name: string, args: Record<string, unknown>): string[] => {
     const w = Math.max(30, size.columns - 10);
     if (name === "run_command") {
-      const lines = sanitizeForDisplay(String(args.command ?? "")).split("\n");
-      return [...lines.slice(0, 6).map((l) => clip(l, w)), ...(lines.length > 6 ? [theme.dim(`… +${lines.length - 6} lines`)] : []), ...(args.cwd ? [theme.dim(`in ${String(args.cwd)}`)] : [])];
+      // Every character of the command, wrapped rather than cut, with control
+      // characters made visible: what you approve is exactly what runs.
+      const shown = revealForApproval(String(args.command ?? ""));
+      const lines = shown.split("\n").flatMap((l) => (l.length > w ? l.match(new RegExp(`.{1,${w}}`, "gu")) ?? [l] : [l]));
+      const max = 24;
+      const extra = shown !== String(args.command ?? "").replace(/\t/g, "    ") ? [theme.warn("Contains control characters (shown as ␍ ␛ …) — check carefully.")] : [];
+      return [...extra, ...lines.slice(0, max), ...(lines.length > max ? [theme.dim(`… +${lines.length - max} more lines (the full command runs)`)] : []), ...(args.cwd ? [theme.dim(`in ${String(args.cwd)}`)] : [])];
     }
     if (name === "write_file") {
       const content = sanitizeForDisplay(String(args.content ?? ""));
@@ -399,6 +404,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const run = async (): Promise<boolean> => {
       if (abortRef.current?.signal.aborted) return false;
       if (alwaysAllow.current.has(name)) return true;
+      // A picker open mid-turn would compete for y/n/Esc with the prompt.
+      if (modeRef.current.type !== "chat" && modeRef.current.type !== "login") {
+        sideAbort.current?.abort();
+        setMode({ type: "chat" });
+      }
       const previous = live.current.activity.phase;
       live.current.activity.phase = "approval";
       if (!agentLabel) { live.current.main.state = "approval"; live.current.main.detail = describeAction(name, args, 50).replace(/\x1b\[[0-9;]*m/g, ""); }
@@ -665,7 +675,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         refreshTokens();
         // In agent mode onUsage fires each round; the latest request's prompt
         // count is the live context size.
-        setUsage({ ctx: u.prompt, prompt: u.prompt, completion: u.completion, approx: false });
+        setUsage({ ctx: u.prompt, prompt: u.prompt, completion: completionTokens, approx: false });
       },
       onNotice: (note) => {
         stats.recoveries++;
@@ -916,8 +926,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       if (useTools && planMode === "on" && (toolsMode === "cmds" || toolsMode === "yolo") && source === "user") {
         const approved = await planFirst(agentHistory, ctrl);
         if (!approved) {
+          // A finished turn (not an interrupted one): nothing to resume later.
+          pendingRef.current = null;
           setStream(null);
           abortRef.current = null;
+          push({ kind: "turn", tone: "warn", text: "Plan not approved — nothing ran." });
           await persist();
           return;
         }
@@ -957,7 +970,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           return now.map((q) => q.text);
         },
       });
-      if (result.end === "max-rounds") endNote = `Stopped after ${result.rounds} steps (the per-turn limit). Send "continue" to keep going.`;
+      if (result.end === "interrupted") endNote = "The connection kept dropping mid-reply, so this turn stopped. Your work so far is saved; send \"continue\" when the connection is stable.";
+      else if (result.end === "max-rounds") endNote = `Stopped after ${result.rounds} steps (the per-turn limit). Send "continue" to keep going.`;
       else if (result.end === "gave-up") endNote = /no success is implied/.test(result.text)
         ? "The model stopped without doing what it announced. Send \"continue\" or try another /model."
         : "The model kept hitting its output limit without finishing. Try /effort low or ask for smaller steps.";
@@ -1082,20 +1096,31 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       if (verdict.met) {
         success(`◎ Goal met after ${turns} turn${turns === 1 ? "" : "s"} (${formatElapsed(Date.now() - g.startedAt)}): ${verdict.reason}.`);
         setGoal(null);
+        queueRef.current = queueRef.current.filter((q) => q.source !== "goal");
+        syncQueueLen();
       } else if (turns >= g.maxTurns) {
         warn(`◎ Goal not met after ${turns} turns — stopping here. Last check: ${verdict.reason}. /goal resume keeps going.`);
         pausedGoal.current = { ...g, turns, lastReason: verdict.reason };
         setGoal(null);
+        queueRef.current = queueRef.current.filter((q) => q.source !== "goal");
+        syncQueueLen();
       } else {
         const next = { ...g, turns, lastReason: verdict.reason };
         setGoal(next);
         push({ kind: "info", text: `◎ Goal not met yet (turn ${turns}/${g.maxTurns}): ${verdict.reason} — continuing.` });
-        // Behind anything the user queued meanwhile (a /goal clear must win).
+        // Behind anything the user queued meanwhile (a /goal clear must win),
+        // and never more than one goal turn waiting.
+        queueRef.current = queueRef.current.filter((q) => q.source !== "goal");
         queueRef.current.push({ text: continuationPrompt(next, verdict), source: "goal" });
         syncQueueLen();
       }
     } catch (err) {
-      if (err instanceof AbortedError) pause("◎ Goal check stopped — goal paused. /goal resume continues it.");
+      if (err instanceof AbortedError && interruptedForMessage.current) {
+        // Ctrl+S during the check: your message runs next and the goal carries on.
+        interruptedForMessage.current = false;
+        queueRef.current.push({ text: continuationPrompt(g, { met: false, reason: "the check was interrupted by your message" }), source: "goal" });
+        syncQueueLen();
+      } else if (err instanceof AbortedError) pause("◎ Goal check stopped — goal paused. /goal resume continues it.");
       else pause(`◎ Goal check failed: ${friendly(err)} — goal paused. /goal resume to try again.`, "warn");
     } finally {
       abortRef.current = null;
@@ -1145,13 +1170,23 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         inputs: historyRef.current.slice(-MAX_SAVED_INPUTS),
         stats: { ...sessionStats.current },
       });
-      // The history and what was shown since the last save (for an exact
-      // /resume) are written together, so an exit waits for both.
+      // The history first, then what was shown since the last save (for an
+      // exact /resume): if the history can't be saved, the display log must
+      // not get ahead of it.
       const shown = viewPending.current.splice(0);
-      const [historySaved, viewSaved] = await Promise.allSettled([appendSession(session.current), appendView(session.current.id, shown)]);
-      if (viewSaved.status === "rejected") viewPending.current.unshift(...shown);
-      if (historySaved.status === "rejected") throw historySaved.reason;
-      if (viewSaved.status === "rejected") throw viewSaved.reason;
+      try {
+        await appendSession(session.current);
+      } catch (err) {
+        viewPending.current.unshift(...shown);
+        throw err;
+      }
+      try {
+        await appendView(session.current.id, shown);
+      } catch (err) {
+        viewPending.current.unshift(...shown);
+        throw err;
+      }
+      persistWarned.current = false; // a later failure is reported again
       if (first) pruneSessions();
     } catch (err) {
       if (!persistWarned.current) error(`Couldn't save this chat to ${sessionsDir()}. ${err instanceof Error ? err.message : "/resume may not contain the latest turn."}`);
@@ -1206,6 +1241,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     }
     session.current = s;
     setUsage(null); // new context; counts start fresh on the next message
+    // The previous chat's goal or loop runs must not run in this one.
+    queueRef.current = queueRef.current.filter((q) => q.source === "user");
+    syncQueueLen();
+    lastAgents.current = [];
     const available = new Set(loadSkills().map((k) => k.name));
     setActiveSkills((s.skills ?? []).filter((n) => available.has(n)));
     messages.current = [...s.messages];
@@ -1255,7 +1294,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     } else {
       replay = replayItems(messages.current, toolHistory.current);
     }
-    viewPending.current = [];
+    // What resume adds (an interrupted reply's tail and its note) is part of
+    // the transcript from now on, so the next resume shows it too.
+    viewPending.current = view.length ? replay.slice(view.length).map((it) => ({ ...(it as object) }) as ViewItem) : [];
     stdout.write("\x1b[2J\x1b[3J\x1b[H");
     const header: Item = { id: id(), kind: "header", model: nextModel, loggedIn: !!auth.key, keySource: auth.source };
     note(`Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${s.toolHistory?.length ?? 0} tool results · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)}`);
@@ -1467,7 +1508,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     setGoal(g);
     success(`◎ Goal set — the agent keeps working until: ${g.condition}`);
     info(`Checked after every turn by an independent evaluator · up to ${g.maxTurns} turns · /goal clear to stop.`);
-    queueRef.current.unshift({ text: kickoffPrompt(g), source: "goal" });
+    queueRef.current = queueRef.current.filter((q) => q.source !== "goal");
+    // Set mid-turn: the check after this turn starts the goal; no extra kickoff.
+    if (!runningTurn.current) queueRef.current.unshift({ text: kickoffPrompt(g), source: "goal" });
     syncQueueLen();
     setQueueTick((n) => n + 1);
   };
@@ -1652,6 +1695,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         setUsage(null);
         session.current = null; // the old chat stays saved; this starts a new one
         viewPending.current = [];
+        // A new chat starts clean: no goal, loop, queued goal/loop runs or old stats.
+        setGoal(null);
+        pausedGoal.current = null;
+        setLoop(null);
+        queueRef.current = queueRef.current.filter((q) => q.source === "user");
+        syncQueueLen();
+        sessionStats.current = emptySessionStats();
+        lastView.current = null;
+        lastAgents.current = [];
         stdout.write("\x1b[2J\x1b[3J\x1b[H");
         setItems([{ id: id(), kind: "header", model, loggedIn: !!auth.key, keySource: auth.source }]);
         setStaticKey((k) => k + 1);
@@ -1877,12 +1929,20 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const ctrl = new AbortController();
     const owns = !runningTurn.current;
     if (owns) abortRef.current = ctrl;
+    sideAbort.current = ctrl;
     return {
       ctrl,
       busy: (label: string | null) => { if (owns) setBusy(label); },
-      done: () => { if (abortRef.current === ctrl) abortRef.current = null; if (owns) setBusy(null); },
+      done: () => {
+        if (abortRef.current === ctrl) abortRef.current = null;
+        if (sideAbort.current === ctrl) sideAbort.current = null;
+        if (owns) setBusy(null);
+      },
     };
   };
+
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
 
   const apiInfo = async () => {
     push({ kind: "plain", text: apiLines(auth.key, auth.source, model) });
@@ -1937,10 +1997,15 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         else error(`No model named "${arg}". Type /model to pick from the list.`);
         return;
       }
+      // Closed (Esc / Ctrl+C) while the list was loading: don't reopen it.
+      if (modeRef.current.type !== "picker") return;
       const cur = ids.indexOf(model);
       setMode({ type: "picker", models: ids, selected: cur >= 0 ? cur : 0 });
     } catch (err) {
-      if (ctrl.signal.aborted) return;
+      if (ctrl.signal.aborted) {
+        if (modeRef.current.type === "picker") setMode({ type: "chat" });
+        return;
+      }
       setMode({ type: "chat" });
       error(`Couldn't load models: ${friendly(err)}`);
     } finally {
@@ -2001,7 +2066,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const slashQuery = mode.type === "chat" && /^\/\S*$/.test(editor.value) ? editor.value.slice(1) : null;
   const slashMatches = slashQuery !== null ? filterCommands(slashQuery) : [];
   // The menu also works while the agent runs; see runsMidTurn for what runs at once.
-  const menuOpen = slashQuery !== null && !busy;
+  // Not while browsing ↑ history: a recalled "/stats" must not take over the arrows.
+  const menuOpen = slashQuery !== null && !busy && histIdx === null;
 
   useEffect(() => setSlashSel(0), [slashQuery]);
 
@@ -2030,6 +2096,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     else void sendChat(text);
   };
 
+  /** The latest side request (/model list, /api check), so a closed picker can cancel it. */
+  const sideAbort = useRef<AbortController | null>(null);
   /** Ctrl+Enter / Ctrl+S: stop the running turn and send this message now. */
   const interruptedForMessage = useRef(false);
   const sendNow = (value: string) => {
@@ -2054,6 +2122,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       if (key.escape) {
         setMode({ type: "chat" });
         setEditor(EMPTY);
+        abortRef.current?.abort();
         info("Login cancelled.");
         return true;
       }
@@ -2119,19 +2188,47 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   );
 
   // Global keys: approvals, Esc/Ctrl+C stop, Ctrl+D exits.
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
+  const approvalPaste = useRef(false);
+  /** Edit the draft typed while a prompt is open (the input box is not focused then). */
+  const editDraft = (value: string) => {
+    editorRef.current = { value, cursor: value.length };
+    setEditor(editorRef.current);
+  };
   useInput((input, key) => {
+    // These work everywhere, prompts included: see which agent is asking, or
+    // switch verbose while waiting.
+    if (key.ctrl && input === "t") {
+      setAgentsExpanded((v) => !v);
+      return;
+    }
+    if (key.ctrl && input === "o") {
+      verboseCommand("");
+      return;
+    }
     // Pending action approval: only y/a/n (or 1/2/3) answer; Enter and other
     // keys keep waiting. Input in the first 150ms after arming is dropped
     // (the submit-Enter echo on Windows terminals).
     if (approvalAnswerRef.current) {
       const armedFor = Date.now() - approvalArmedAt.current;
+      const draft = editorRef.current.value;
       if (key.ctrl && input === "c") {
         approvalAnswerRef.current(false);
         abortRef.current?.abort();
         return;
       }
+      // A paste goes into the draft whole, newlines included.
+      if ((input ?? "").includes("[200~")) approvalPaste.current = true;
+      if (approvalPaste.current) {
+        const ended = (input ?? "").includes("[201~");
+        const chunk = key.return ? "\n" : (input ?? "").replace(/\x1b?\[20[01]~/g, "").replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+        if (ended) approvalPaste.current = false;
+        if (chunk && armedFor >= 150) editDraft(draft + chunk);
+        return;
+      }
       // With an empty input, y/a/n (1/2/3) and Esc answer the prompt.
-      if (!editor.value) {
+      if (!draft) {
         const answer = approvalAnswer(input ?? "", key, armedFor);
         if (answer !== undefined) {
           approvalAnswerRef.current(answer);
@@ -2145,21 +2242,22 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       // of dropping it. Once a draft exists, every key goes to the draft, so
       // typing can never answer the prompt by accident. Enter sends the draft
       // to the agent (delivered at its next step); the prompt stays open.
-      if (armedFor < 150 || key.ctrl || key.meta || key.tab || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow) return;
+      if (armedFor < 150 || key.meta || key.tab || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow) return;
+      if (key.ctrl) {
+        if (input === "u") editDraft("");
+        else if (input === "w") editDraft(draft.replace(/\S+\s*$/, ""));
+        return;
+      }
       if (key.return) {
-        if (editor.value.trim()) submitChat(editor.value);
+        if (draft.trim()) submitChat(draft);
         return;
       }
       if (key.backspace || key.delete) {
-        const value = editor.value.slice(0, -1);
-        setEditor({ value, cursor: value.length });
+        editDraft(draft.slice(0, -1));
         return;
       }
       const text = (input ?? "").replace(/[\x00-\x1f\x7f]/g, "");
-      if (text) {
-        const value = editor.value + text;
-        setEditor({ value, cursor: value.length });
-      }
+      if (text) editDraft(draft + text);
       return;
     }
     // plan approval: arrow-select Start/Cancel, Enter confirms, Esc = cancel
@@ -2192,21 +2290,18 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       showFlash(waiting ? `Esc again to stop — ${waiting} queued will run next` : "Press Esc again to stop", 2500);
       return;
     }
-    if (key.ctrl && input === "t") {
-      setAgentsExpanded((v) => !v);
-      return;
-    }
-    if (key.ctrl && input === "o") {
-      verboseCommand("");
-      return;
-    }
     if (key.ctrl && input === "c") {
+      // A picker closes first, without stopping a running turn.
+      if (mode.type !== "chat" && mode.type !== "login") {
+        sideAbort.current?.abort();
+        setMode({ type: "chat" });
+        return;
+      }
       if (abortRef.current) {
         abortRef.current.abort();
         if (busy) {
           setBusy(null);
           info("Cancelled.");
-          if (mode.type === "picker") setMode({ type: "chat" });
         }
         return;
       }
@@ -2314,7 +2409,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   useInput(
     (_input, key) => {
       if (mode.type !== "picker" || !mode.models) {
-        if (key.escape) setMode({ type: "chat" });
+        if (key.escape) {
+          sideAbort.current?.abort();
+          setMode({ type: "chat" });
+        }
         return;
       }
       const n = mode.models.length;
@@ -2377,7 +2475,22 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   }
 
   const stopHint = flash ?? "esc esc to stop";
-  const liveRows = streamingRowBudget(size.rows, width, editor.value, false, mode.type === "plan-approve" || !!approval) - Math.min(6, live.current.groups.reduce((n, g) => n + g.tasks.length + 1, 0));
+  // Everything else in the live area takes rows the streaming text can't use.
+  // If the live area ever got taller than the terminal, Ink would clear the
+  // whole screen (scrollback included) on every frame.
+  const taskRows = agentsExpanded
+    ? Math.min(18, (live.current.all?.length ?? 1) + 5)
+    : Math.min(9, live.current.groups.reduce((n, g) => n + g.tasks.length + 1, 0));
+  const reserved =
+    taskRows +
+    (verbose && turnActive ? 6 : 0) + // stats panel
+    (menuOpen ? Math.min(10, slashMatches.length + 2) : 0) +
+    (mode.type === "picker" || mode.type === "sessions" || mode.type === "skills" ? 13 : mode.type === "effort" || mode.type === "tool-permissions" ? 7 : 0) +
+    (approval ? approval.body.length + 7 : 0) +
+    (flash ? 1 : 0);
+  const budget = Math.max(2, streamingRowBudget(size.rows, width, editor.value, false, mode.type === "plan-approve") - reserved);
+  const thinkingRows = stream?.thinking?.trim() ? Math.max(2, Math.min(8, Math.floor(budget / 2))) : 0;
+  const liveRows = Math.max(1, budget - thinkingRows - (thinkingRows ? 1 : 0));
 
   return (
     <>
@@ -2387,7 +2500,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
       {stream?.thinking?.trim() ? (
         <Box flexDirection="column" marginTop={1}>
-          <Thinking text={stream.thinking} width={width} maxLines={Math.max(2, Math.min(8, Math.floor(liveRows / 2)))} />
+          <Thinking text={stream.thinking} width={width} maxLines={thinkingRows} />
         </Box>
       ) : null}
 
@@ -2409,7 +2522,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         </Box>
       )}
 
-      {approval && <ApprovalBox approval={approval} width={width} />}
+      {approval && <ApprovalBox approval={approval} width={width} drafting={!!editor.value} />}
 
       {mode.type === "picker" && (
         <Box flexDirection="column" marginTop={1}>
@@ -2581,7 +2694,7 @@ const EFFORT_HINTS: Record<Effort, string> = {
   high: "thinks longest — slower, uses more tokens",
 };
 
-function ApprovalBox({ approval, width }: { approval: Approval; width: number }) {
+function ApprovalBox({ approval, width, drafting }: { approval: Approval; width: number; drafting: boolean }) {
   const w = Math.min(width - 1, 100);
   const tool = toolTitle(approval.tool, {}).replace(/\x1b\[[0-9;]*m/g, "");
   return (
@@ -2592,10 +2705,18 @@ function ApprovalBox({ approval, width }: { approval: Approval; width: number })
         <Text key={i} wrap="truncate-end">{"  " + line}</Text>
       ))}
       <Text> </Text>
-      <Text wrap="truncate-end">
-        {theme.ok("y")} yes   {theme.brand("a")} yes, and don't ask again for {tool} this session   {theme.err("n")} no {theme.dim("(esc)")}
-      </Text>
-      <Text wrap="truncate-end">{theme.dim("Type anything else to write the agent a message; Enter sends it.")}</Text>
+      {drafting ? (
+        <Text wrap="truncate-end">
+          {theme.warn("You're typing a message")}{theme.dim(" — Enter sends it to the agent · Ctrl+U clears it so y / a / n answer · Esc = no")}
+        </Text>
+      ) : (
+        <>
+          <Text wrap="truncate-end">
+            {theme.ok("y")} yes   {theme.brand("a")} yes, and don't ask again for {tool} this session   {theme.err("n")} no {theme.dim("(esc)")}
+          </Text>
+          <Text wrap="truncate-end">{theme.dim("Type anything else to write the agent a message; Enter sends it.")}</Text>
+        </>
+      )}
     </Box>
   );
 }

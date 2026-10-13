@@ -45,3 +45,19 @@ export function sanitizeForDisplay(text: string, tabSize = 4): string {
   }
   return s.replace(CONTROLS, "").replace(DISPUTED_WIDTH, "");
 }
+
+/**
+ * For permission prompts: show exactly what will run. Nothing is dropped or
+ * rewritten — control characters become visible symbols (\r → ␍, ESC → ␛, …),
+ * so a carriage return or escape sequence can't hide part of a command.
+ */
+export function revealForApproval(text: string): string {
+  return text.replace(/\t/g, "    ").replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, (ch) => {
+    const code = ch.charCodeAt(0);
+    if (code === 0x0d) return "␍";
+    if (code === 0x1b) return "␛";
+    if (code < 0x20) return String.fromCharCode(0x2400 + code);
+    if (code === 0x7f) return "␡";
+    return `⟨U+${code.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+  });
+}
