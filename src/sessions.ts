@@ -35,7 +35,14 @@ export interface PendingTurn {
   startedAt: number;
   /** Assistant text streamed so far (bounded). */
   partial: string;
+  /** The part of the reply streamed but not yet printed as a finished block. */
+  unshown?: string;
+  /** Thinking streamed but not yet printed as a finished paragraph. */
+  thinking?: string;
 }
+
+/** One item of the transcript as it was shown (see appendView). */
+export type ViewItem = { kind: string } & Record<string, unknown>;
 
 /** Cap on the partial reply kept for an interrupted turn. */
 export const MAX_PENDING_CHARS = 60_000;
@@ -88,7 +95,7 @@ function parse(raw: string): Session | null {
       notes: Array.isArray(s.notes) ? s.notes.filter((x: unknown): x is string => typeof x === "string").slice(-20) : [],
       toolHistory: Array.isArray(s.toolHistory) ? s.toolHistory.filter(validToolEvent) : [],
       skills: Array.isArray(s.skills) ? s.skills.filter((x: unknown): x is string => typeof x === "string") : [],
-      pending: s.pending && typeof s.pending === "object" && typeof s.pending.partial === "string" && Number.isFinite(s.pending.startedAt) ? { startedAt: s.pending.startedAt, partial: s.pending.partial.slice(-MAX_PENDING_CHARS) } : undefined,
+      pending: s.pending && typeof s.pending === "object" && typeof s.pending.partial === "string" && Number.isFinite(s.pending.startedAt) ? { startedAt: s.pending.startedAt, partial: s.pending.partial.slice(-MAX_PENDING_CHARS), unshown: typeof s.pending.unshown === "string" ? s.pending.unshown.slice(-MAX_PENDING_CHARS) : undefined, thinking: typeof s.pending.thinking === "string" ? s.pending.thinking.slice(-MAX_PENDING_CHARS) : undefined } : undefined,
       goal: s.goal && typeof s.goal.condition === "string" && Number.isFinite(s.goal.turns) && Number.isFinite(s.goal.maxTurns) ? { condition: s.goal.condition, turns: s.goal.turns, maxTurns: s.goal.maxTurns, startedAt: Number(s.goal.startedAt) || 0, lastReason: typeof s.goal.lastReason === "string" ? s.goal.lastReason : undefined } : undefined,
       loop: s.loop && typeof s.loop.prompt === "string" && (s.loop.intervalMs === null || Number.isFinite(s.loop.intervalMs)) ? { prompt: s.loop.prompt, intervalMs: s.loop.intervalMs, iteration: Number(s.loop.iteration) || 0 } : undefined,
       inputs: Array.isArray(s.inputs) ? s.inputs.filter((x: unknown): x is string => typeof x === "string").slice(-MAX_SAVED_INPUTS) : undefined,
@@ -136,6 +143,7 @@ export function deleteSession(id: string): void {
   try {
     fs.rmSync(fileFor(id));
     fs.rmSync(journalFor(id), { force: true });
+    fs.rmSync(viewFor(id), { force: true });
     cursors.delete(fileFor(id));
   } catch {
     /* already gone */
@@ -211,6 +219,61 @@ function validToolEvent(value: unknown): value is ToolEvent {
   return typeof e.id === "string" && typeof e.name === "string" && typeof e.output === "string" && typeof e.ok === "boolean" && !!e.args && typeof e.args === "object" && !Array.isArray(e.args) && Number.isFinite(e.at);
 }
 function journalFor(id: string): string { return fileFor(id).replace(/\.json$/, ".jsonl"); }
+function viewFor(id: string): string { return fileFor(id).replace(/\.json$/, ".view.jsonl"); }
+
+/** The transcript exactly as it was shown (replies, tool blocks, thinking,
+ *  notices, outcome lines), appended as it happens so /resume can replay it.
+ *  Kept next to the session, private like it. */
+const viewWrites = new Map<string, Promise<void>>();
+export function appendView(id: string, items: ViewItem[]): Promise<void> {
+  if (!items.length) return Promise.resolve();
+  const file = viewFor(id);
+  const body = items.map((i) => JSON.stringify(i)).join("\n") + "\n";
+  const next = (viewWrites.get(file) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    await fs.promises.mkdir(sessionsDir(), { recursive: true, mode: 0o700 });
+    await fs.promises.appendFile(file, body, { mode: 0o600 });
+  });
+  viewWrites.set(file, next);
+  return next;
+}
+
+/** Wait (up to `ms`) for queued session and transcript writes, before exit. */
+export async function settleWrites(ms = 3000): Promise<void> {
+  // Saves can start while we wait (a stopped turn writes its final state a
+  // moment after the exit save), so wait until no new write appears.
+  const deadline = Date.now() + ms;
+  const pause = (t: number) => new Promise((r) => setTimeout(r, t));
+  for (;;) {
+    const current = [...writes.values(), ...viewWrites.values()];
+    await Promise.race([Promise.allSettled(current), pause(Math.max(0, deadline - Date.now()))]);
+    if (Date.now() >= deadline) return;
+    await pause(150);
+    const after = [...writes.values(), ...viewWrites.values()];
+    if (after.length === 0 || after.every((p) => current.includes(p))) return;
+  }
+}
+
+/** The saved transcript of a session; [] for chats saved before it existed.
+ *  A line cut short by a crash is skipped. */
+export function loadView(id: string): ViewItem[] {
+  let raw = "";
+  try {
+    raw = fs.readFileSync(viewFor(id), "utf8");
+  } catch {
+    return [];
+  }
+  const out: ViewItem[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const v = JSON.parse(line);
+      if (v && typeof v === "object" && typeof v.kind === "string") out.push(v);
+    } catch {
+      /* torn final line */
+    }
+  }
+  return out;
+}
 interface JournalBatch { start: number; messages: ChatMessage[]; toolStart: number; tools: ToolEvent[] }
 function replayJournal(raw: string): { messages: ChatMessage[]; tools: ToolEvent[]; bytes: number } {
   const end = raw.lastIndexOf("\n") + 1;

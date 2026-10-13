@@ -244,7 +244,7 @@ it, each tool result as it completes, and everything else (including the
 reply while it streams) by an autosave every 10 seconds
 (`UNJAILED_AUTOSAVE_SECONDS`). If you close the terminal, press Ctrl+C or the
 CLI is killed mid-run, `/resume` (or `unjailed -c`) brings the chat back
-entirely: messages, tool results in their places, the partial reply of the
+entirely, exactly as it was shown (thinking, tool blocks, notices and outcome lines included): messages, tool results in their places, the partial reply of the
 interrupted turn, pinned notes, skills, model, ↑ history, session stats, and
 any `/goal` or `/loop` (restored paused, so nothing runs on its own; `/goal resume`
 or `/loop resume` restarts it). The
@@ -268,7 +268,7 @@ unjailed -c     # continue the most recent chat in this folder
 unjailed -r     # choose a saved chat to resume
 ```
 
-Inside the app, `/resume` lists this folder's chats (or every folder's, when this one has none), `/resume <n|id>` opens one directly, and `/sessions` lists all of them. Sessions use a small JSON manifest and an append-only JSONL history in `~/.unjailed/sessions/` (permissions `600`); the newest 200 are kept. To turn saving off, set `UNJAILED_NO_HISTORY=1` or put `"saveSessions": false` in `config.json`.
+Inside the app, `/resume` lists this folder's chats (or every folder's, when this one has none), `/resume <n|id>` opens one directly, and `/sessions` lists all of them. Sessions use a small JSON manifest, an append-only JSONL history, and an append-only log of the transcript as shown (`<id>.view.jsonl`, replayed by `/resume`) in `~/.unjailed/sessions/` (permissions `600`); the newest 200 are kept. To turn saving off, set `UNJAILED_NO_HISTORY=1` or put `"saveSessions": false` in `config.json`.
 
 ## Skills
 
@@ -363,7 +363,7 @@ command. Use `/auto` only when you want those actions to run without prompts.
 |---|---|
 | Enter | Send. While the agent works (tools on), your message is delivered to it at its next step. Most `/commands` run at once even mid-turn; plain-chat messages (tools off) and the commands that would disrupt the turn are **queued** and run when it finishes (the footer shows how many are waiting). |
 | Shift+Enter, or `\` then Enter | New line. Alt+Enter and Ctrl+J also work, for terminals that don't report Shift+Enter. |
-| ↑ / ↓ | Step through your previous inputs (on the first/last line); inside a multi-line draft they move the cursor between lines |
+| ↑ / ↓ | Move between the rows of your draft, including the rows of a long wrapped line; on the first or last row they step through previous inputs |
 | ← / →, Home / End | Move the cursor; Home/End jump to the start/end of the line |
 | Ctrl+A / Ctrl+E | Jump to the start / end of the line |
 | Ctrl+U / Ctrl+K | Delete to the start / end of the line |
@@ -372,6 +372,7 @@ command. Use `/auto` only when you want those actions to run without prompts.
 | Paste | Multi-line pastes stay in the input box; they're never sent until you press Enter |
 | Esc | Close menus. While a turn is running, press Esc **twice** to stop it (the first press arms it, so a stray Esc won't kill a long run). This also stops subagents, workflows and retry waits. |
 | y / a / n (or 1 / 2 / 3) | Answer a permission prompt: allow once, allow that tool for the session, decline. Esc also declines; Ctrl+C declines and stops the turn. Typing anything else starts a message instead; Enter sends it to the agent while the prompt stays open. |
+| Ctrl+Enter or Ctrl+S | Send now: stops the running turn and sends what you typed straight away (a running `/goal` or `/loop` carries on). Ctrl+Enter needs a terminal that reports it (kitty, WezTerm, ghostty, iTerm2, xterm); Ctrl+S works everywhere. |
 | Ctrl+T | Expand or collapse the live agents view |
 | Ctrl+O | Toggle verbose: thinking, subagent steps and full tool output |
 | Ctrl+C | Stops the response while one is streaming. Otherwise closes an open picker, then clears the input; press it twice to exit. |

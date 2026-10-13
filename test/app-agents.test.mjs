@@ -306,3 +306,39 @@ test("/auto typed mid-run stops the permission prompts for the rest of the runni
     await waitFor(ui, /Bash\(echo three\)\n\s+⎿\s+three[\s\S]*Worked for/, "rest of the batch ran unattended", 15_000);
   } finally { ui.unmount(); writeConfig({ autoMode: "ask", tools: "yolo" }); }
 });
+
+test("Ctrl+S (or Ctrl+Enter) interrupts a running reply and sends the new message at once", async () => {
+  writeConfig({ tools: "off", plan: false, fx: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(ui, "slow reply please");
+    await waitFor(ui, /Slow token 2/, "slow reply streaming");
+    ui.stdin.write("new direction now"); await sleep(60);
+    ui.stdin.write("\x13"); // Ctrl+S
+    await waitFor(ui, /Interrupting the current turn to send: new direction now/, "interrupt notice");
+    await waitFor(ui, /Interrupted to send your message/, "the old turn ends at once");
+    await waitFor(ui, /You said: "new direction now"/, "the new message runs right away", 10_000);
+    assert.doesNotMatch(all(ui), /Slow token 60/, "the slow reply did not run to the end");
+  } finally { ui.unmount(); }
+});
+
+test("/resume replays the chat as it was shown: thinking, subagent steps, tool blocks and outcome lines", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false, verbose: true });
+  const first = render(React.createElement(App));
+  try {
+    await sleep(150);
+    await type(first, "mock:think for resume");
+    await waitFor(first, /The folder holds calc\.py[\s\S]*Worked for/, "turn done");
+    await sleep(300);
+  } finally { first.unmount(); }
+  await sleep(300);
+  const again = render(React.createElement(App, { startup: "continue" }));
+  try {
+    await waitFor(again, /Resumed "mock:think for resume"/, "resumed");
+    const out = all(again);
+    const order = ["› mock:think for resume", "∴ The user wants a look at this folder", "List(.)", "↳ Deep read: Read(calc.py)", "Agent(Deep read)", "∴ Both results are in", "The folder holds calc.py", "Worked for"];
+    let at = -1;
+    for (const piece of order) { const i = out.indexOf(piece, at + 1); assert.ok(i > at, `"${piece}" restored in order`); at = i; }
+  } finally { again.unmount(); writeConfig({ verbose: false }); }
+});

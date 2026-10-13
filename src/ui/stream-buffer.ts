@@ -76,6 +76,11 @@ export class StreamDisplayBuffer {
     return { text, hiddenCharacters: this.pendingCharacters - text.length };
   }
 
+  /** Everything not yet drained, without consuming it (for saving a turn mid-paragraph). */
+  peek(): string {
+    return this.parts.slice(this.head).join("");
+  }
+
   finish(): string {
     const result = this.parts.slice(this.head).join("");
     this.parts = [];

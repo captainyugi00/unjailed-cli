@@ -109,3 +109,27 @@ test("↑ history in a new session starts from the latest chat in this folder", 
     assert.match(ui.lastFrame(), /Now add tests|write me a long essay/);
   } finally { ui.unmount(); globalThis.fetch = original; }
 });
+
+test("a chat with a display log replays it exactly, without repeating an interrupted reply that was already shown", async () => {
+  const { appendView } = await import("../dist/sessions.js");
+  const cwd = process.cwd();
+  const s = newSession(cwd, "kimi-k3");
+  Object.assign(s, { title: "Log replay", messages: [{ role: "user", content: "Log replay" }], pending: { startedAt: Date.now(), partial: "Half a reply", unshown: "Half a reply" } });
+  await appendSession(s);
+  await appendView(s.id, [
+    { kind: "user", text: "Log replay" },
+    { kind: "info", text: "✻ Thought for 4s" },
+    { kind: "assistant", text: "Half a reply", first: true },
+    { kind: "turn", tone: "warn", text: "Stopped by you after 3s" },
+  ]);
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => Response.json({ data: [{ id: "kimi-k3" }] });
+  const ui = render(React.createElement(App, { startup: "continue" }));
+  try {
+    await waitFor(ui, /Resumed "Log replay"/, "resumed");
+    const out = all(ui);
+    assert.match(out, /Thought for 4s[\s\S]*Half a reply[\s\S]*Stopped by you after 3s/, "replayed in order");
+    assert.equal(out.split("Half a reply").length - 1, 1, "the reply appears once");
+    assert.doesNotMatch(out, /interrupted when the CLI closed/, "the turn had already ended on screen");
+  } finally { ui.unmount(); globalThis.fetch = original; }
+});

@@ -26,7 +26,7 @@ import { theme, tone } from "../theme.js";
 import { Header } from "./Header.js";
 import { FinishFlourish } from "./Snow.js";
 import { fxEnabled } from "./fx.js";
-import { onFirstLine, onLastLine, Prompt, type EditorState } from "./Prompt.js";
+import { labelWidth, onFirstVisualRow, onLastVisualRow, Prompt, type EditorState } from "./Prompt.js";
 import { SelectList } from "./SelectList.js";
 import { Spinner } from "./Spinner.js";
 import { useTerminalSize } from "./useTerminalSize.js";
@@ -50,6 +50,9 @@ import {
   titleFrom,
   MAX_PENDING_CHARS,
   MAX_SAVED_INPUTS,
+  appendView,
+  loadView,
+  type ViewItem,
   type PendingTurn,
   type Session,
   type SessionMeta,
@@ -133,6 +136,10 @@ function friendly(err: unknown): string {
   if (err instanceof WorkflowError) return err.message;
   return "Something went wrong. Try again.";
 }
+
+/** How much of a chat /resume prints (the full history stays available to the agent). */
+const RESUME_ITEMS = 600;
+const RESUME_CHARS = 600_000;
 
 /** Autosave interval (UNJAILED_AUTOSAVE_SECONDS, default 10). */
 const AUTOSAVE_MS = (() => {
@@ -265,7 +272,14 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     setLoopState(l ? { ...l } : null);
   };
 
+  /** Transcript items not yet written to the session's display log. */
+  const viewPending = useRef<ViewItem[]>([]);
+  /** Keep an item for /resume without showing it (thinking while verbose is off). */
+  const record = (...newItems: NewItem[]) => {
+    for (const it of newItems) if (it.kind !== "header") viewPending.current.push({ ...(it as object), kind: it.kind } as ViewItem);
+  };
   const push = (...newItems: NewItem[]) => {
+    record(...newItems);
     setItems((prev) => retainDisplayWindow([...prev, ...newItems.map((it) => ({ ...it, id: id() }) as Item)]));
   };
   const info = (text: string) => push({ kind: "info", text });
@@ -334,7 +348,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
   // Leaving the app (exit, or an embedder unmounting it) stops any running
   // turn, subagents and retry waits; otherwise they would keep going unseen.
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => () => {
+    abortRef.current?.abort();
+    saveIfChangedRef.current?.();
+  }, []);
 
   // Exit on the next render so the live area (prompt, menus) is cleared first.
   const [exiting, setExiting] = useState(false);
@@ -490,7 +507,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const started = Date.now();
     // Save the prompt right away and after each tool; the autosave timer
     // keeps the partial reply current in between (see AUTOSAVE_MS).
-    const pendingNow = (): PendingTurn => ({ startedAt: started, partial: full });
+    const pendingNow = (): PendingTurn => ({ startedAt: started, partial: full, unshown: displayBuffer.peek(), thinking: thinkingText });
     pendingRef.current = pendingNow;
     const saveProgress = (_force = true) => void persist(pendingNow());
     live.current = freshLive("waiting", started);
@@ -551,7 +568,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           flushedAny = true;
         }
       }
-      if (verboseRef.current) flushThinking(false);
+      flushThinking(false);
       const preview = displayBuffer.preview();
       setStream({ text: preview.text, hiddenCharacters: preview.hiddenCharacters, flushed: flushedAny, thinking: verboseRef.current ? thinkingText : undefined });
     };
@@ -577,7 +594,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       const done = thinkingText.slice(0, cut).trim();
       thinkingText = thinkingText.slice(cut).replace(/^\n+/, "");
       if (done) {
-        push({ kind: "thinking", text: done });
+        // Always kept for /resume; shown live only with /verbose.
+        if (verboseRef.current) push({ kind: "thinking", text: done });
+        else record({ kind: "thinking", text: done });
         thinkingShown = true;
       }
     };
@@ -630,10 +649,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         streamedChars += t.length;
         reasoningChars += t.length;
         refreshTokens();
-        if (verboseRef.current) {
-          thinkingText += t;
-          schedule();
-        }
+        thinkingText += t;
+        if (verboseRef.current) schedule();
+        else if (/\n\n/.test(t)) flushThinking(false);
       },
       onUsage: (u) => {
         gotUsage = true;
@@ -974,9 +992,6 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     // saved when the turn started, and the next turn needs it as context.
     if (full.trim()) messages.current.push({ role: "assistant", content: full.trim() });
     pendingRef.current = null;
-    // A tool may have changed a file before the model disconnected. Retain
-    // that task and its evidence even when no assistant prose arrived.
-    await persist();
 
     // Server didn't report usage — show a rough estimate (chars/4), clearly marked.
     if (!gotUsage) {
@@ -989,7 +1004,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const tokens = live.current.activity.tokens;
     const tools = turnEvents.length;
     const summary = [elapsed, tools ? `${tools} tool call${tools === 1 ? "" : "s"}` : "", tokens ? `↓ ${formatTokens(tokens)} tokens` : ""].filter(Boolean).join(" · ");
-    if (outcome === "stopped") push({ kind: "turn", tone: "warn", text: `Stopped by you after ${summary}` });
+    if (outcome === "stopped" && interruptedForMessage.current) push({ kind: "turn", tone: "warn", text: `Interrupted to send your message after ${summary}` });
+    else if (outcome === "stopped") push({ kind: "turn", tone: "warn", text: `Stopped by you after ${summary}` });
     else if (outcome === "error") push({ kind: "turn", tone: "error", text: `${errMsg}  (${summary})` });
     else if (endNote) push({ kind: "turn", tone: "warn", text: `${endNote}  (${summary})` });
     else if (!full.trim() && !tools) push({ kind: "turn", tone: "warn", text: `The model returned no text — it may have hit its output limit mid-reasoning. Try /effort low or another model.  (${summary})` });
@@ -1002,6 +1018,10 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     lastView.current = { ...live.current, all: lastAgents.current, stats: { ...stats, tools: { ...stats.tools } } };
     sessionStats.current = addTurnToSession(sessionStats.current, lastView.current, Date.now() - started);
     live.current.groups = [];
+    // Save the finished turn, its outcome line included. A tool may have
+    // changed a file before the model disconnected: that task and its
+    // evidence are kept even when no assistant prose arrived.
+    await persist();
 
     await afterTurn(outcome, text, turnEvents, scheduleDecision, loopRun);
   };
@@ -1014,13 +1034,17 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     decision: { delay: number; reason: string; stop: boolean } | null,
     loopRun: LoopState | null,
   ) => {
+    // A turn stopped by Ctrl+Enter / Ctrl+S to send a message isn't a "stop":
+    // goals and loops carry on.
+    const interrupted = outcome === "stopped" && interruptedForMessage.current;
+    interruptedForMessage.current = false;
     // /loop: schedule the next run, whatever happened (a failed run must not end the loop).
     if (loopRun && loopRef.current?.id === loopRun.id) {
       const l = loopRef.current;
       if (decision?.stop) {
         success(`Loop finished after ${l.iteration} run${l.iteration === 1 ? "" : "s"}${decision.reason ? ` — ${decision.reason.replace(/[.\s]+$/, "")}` : ""}.`);
         setLoop(null);
-      } else if (outcome === "stopped") {
+      } else if (outcome === "stopped" && !interrupted) {
         info("Loop paused — this run was stopped. /loop resume to continue it, /loop stop to end it.");
         setLoop({ ...l, nextAt: null, lastReason: "paused" });
       } else {
@@ -1040,6 +1064,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       syncQueueLen();
       push({ kind: tone, text: note });
     };
+    // Interrupting to say something isn't stopping the goal: it keeps going after your message.
+    if (interrupted) return;
     if (outcome === "stopped") return pause("◎ Goal paused because you stopped the turn. /goal resume continues it, /goal clear removes it.");
     if (outcome === "error") return pause("◎ Goal paused: the turn ended with an error. /goal resume continues when you're ready.", "warn");
     const ctrl = new AbortController();
@@ -1086,9 +1112,16 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
    *  Called at the start of a turn, after every tool, while a reply streams
    *  and at the end, so closing the CLI mid-run loses at most a few seconds.
    *  `pending` is the turn in progress (null when it has finished). */
+  /** What a save captures, to skip saves that would change nothing. */
+  const saveSignature = (pending: PendingTurn | null) => {
+    const g = goalRef.current ?? pausedGoal.current;
+    return [messages.current.length, toolHistory.current.length, notes.current.length, pending ? `${pending.partial.length}:${pending.unshown?.length ?? 0}:${pending.thinking?.length ?? 0}` : -1, g ? `${g.condition.length}:${g.turns}` : "", loopRef.current?.iteration ?? "", historyRef.current.length, latestState.current.model, latestState.current.activeSkills.join(",")].join("|");
+  };
+
   const persist = async (pending: PendingTurn | null = null) => {
     // Read state through a ref: the autosave timer holds an old copy of this function.
     const { model, activeSkills } = latestState.current;
+    lastSaved.current = saveSignature(pending);
     if (!sessionsEnabled() || (!messages.current.length && !toolHistory.current.length && !notes.current.length)) return;
     try {
       const first = !session.current;
@@ -1106,13 +1139,19 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         messages: [...messages.current],
         toolHistory: [...toolHistory.current],
         notes: [...notes.current],
-        pending: pending ? { startedAt: pending.startedAt, partial: pending.partial.slice(-MAX_PENDING_CHARS) } : undefined,
+        pending: pending ? { startedAt: pending.startedAt, partial: pending.partial.slice(-MAX_PENDING_CHARS), unshown: pending.unshown?.slice(-MAX_PENDING_CHARS), thinking: pending.thinking?.slice(-MAX_PENDING_CHARS) } : undefined,
         goal: g ? { condition: g.condition, turns: g.turns, maxTurns: g.maxTurns, startedAt: g.startedAt, lastReason: g.lastReason } : undefined,
         loop: l ? { prompt: l.prompt, intervalMs: l.intervalMs, iteration: l.iteration } : undefined,
         inputs: historyRef.current.slice(-MAX_SAVED_INPUTS),
         stats: { ...sessionStats.current },
       });
-      await appendSession(session.current);
+      // The history and what was shown since the last save (for an exact
+      // /resume) are written together, so an exit waits for both.
+      const shown = viewPending.current.splice(0);
+      const [historySaved, viewSaved] = await Promise.allSettled([appendSession(session.current), appendView(session.current.id, shown)]);
+      if (viewSaved.status === "rejected") viewPending.current.unshift(...shown);
+      if (historySaved.status === "rejected") throw historySaved.reason;
+      if (viewSaved.status === "rejected") throw viewSaved.reason;
       if (first) pruneSessions();
     } catch (err) {
       if (!persistWarned.current) error(`Couldn't save this chat to ${sessionsDir()}. ${err instanceof Error ? err.message : "/resume may not contain the latest turn."}`);
@@ -1128,15 +1167,16 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const lastSaved = useRef("");
   // Autosave every AUTOSAVE_MS, idle or mid-run, whenever anything changed:
   // a killed or closed CLI loses at most that much of a streaming reply.
+  /** Save if anything changed since the last save (autosave and exit). */
+  const saveIfChanged = () => {
+    const pending = pendingRef.current?.() ?? null;
+    if (saveSignature(pending) === lastSaved.current && !viewPending.current.length) return;
+    void persist(pending);
+  };
+  const saveIfChangedRef = useRef(saveIfChanged);
+  saveIfChangedRef.current = saveIfChanged;
   useEffect(() => {
-    const t = setInterval(() => {
-      const pending = pendingRef.current?.() ?? null;
-      const g = goalRef.current ?? pausedGoal.current;
-      const signature = [messages.current.length, toolHistory.current.length, notes.current.length, pending ? pending.partial.length : -1, g ? `${g.condition.length}:${g.turns}` : "", loopRef.current?.iteration ?? "", historyRef.current.length, latestState.current.model, latestState.current.activeSkills.join(",")].join("|");
-      if (signature === lastSaved.current) return;
-      lastSaved.current = signature;
-      void persist(pending);
-    }, AUTOSAVE_MS);
+    const t = setInterval(() => saveIfChangedRef.current(), AUTOSAVE_MS);
     return () => clearInterval(t);
     // persist reads refs, so the interval never needs to restart
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1194,6 +1234,28 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     } else if (messages.current.at(-1)?.role === "user") {
       interrupted = true; // closed before any reply was saved
     }
+
+    // The transcript exactly as it was shown, when the chat has a display log
+    // (thinking only with /verbose on, as live); older chats are rebuilt from
+    // their messages and tool results.
+    const view = loadView(s.id).filter((v) => v.kind !== "thinking" || verboseRef.current);
+    let replay: NewItem[];
+    if (view.length) {
+      replay = view as unknown as NewItem[];
+      // If the interrupted turn had already printed its end (an outcome line
+      // after the last prompt), its text is in the log; don't add it twice.
+      const lastPrompt = replay.map((v) => v.kind).lastIndexOf("user");
+      const turnEnded = replay.slice(lastPrompt + 1).some((v) => v.kind === "turn");
+      if (turnEnded) interrupted = false;
+      const thought = turnEnded ? "" : s.pending?.thinking?.trim();
+      if (thought && verboseRef.current) replay = [...replay, { kind: "thinking", text: thought }];
+      const tail = turnEnded ? "" : s.pending?.unshown?.trim();
+      if (tail) replay = [...replay, { kind: "assistant", text: tail, first: false }];
+      if (s.pending && !turnEnded) replay = [...replay, { kind: "warn", text: "This reply was interrupted when the CLI closed." }];
+    } else {
+      replay = replayItems(messages.current, toolHistory.current);
+    }
+    viewPending.current = [];
     stdout.write("\x1b[2J\x1b[3J\x1b[H");
     const header: Item = { id: id(), kind: "header", model: nextModel, loggedIn: !!auth.key, keySource: auth.source };
     note(`Resumed "${s.title}" · ${s.messages.filter((m) => m.role === "user").length} messages · ${s.toolHistory?.length ?? 0} tool results · ${prettyPath(s.cwd)} · ${timeAgo(s.updated)}`);
@@ -1201,7 +1263,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     if (s.goal) note(`◎ Goal restored (paused): ${clip(s.goal.condition, 120)} — /goal resume to continue it.`);
     if (s.loop) note(`↻ Loop restored (paused): ${clip(s.loop.prompt, 80)} — /loop resume to restart it, /loop stop to drop it.`);
     if (notes.current.length) note(`${notes.current.length} pinned note${notes.current.length === 1 ? "" : "s"} restored.`);
-    setItems(retainDisplayWindow([header, ...replayItems(messages.current, toolHistory.current).map((it) => ({ ...it, id: id() }) as Item), ...notesAfter]));
+    // A long chat shows its most recent part; the agent still has all of it.
+    const shown = retainDisplayWindow(replay.map((it) => ({ ...it, id: id() }) as Item), RESUME_ITEMS, RESUME_CHARS);
+    const hidden = replay.length - shown.length;
+    const earlier: Item[] = hidden > 0 ? [{ id: id(), kind: "info", text: `⋯ ${hidden} earlier item${hidden === 1 ? "" : "s"} of this chat aren't shown here; the agent still has the full history (search_history).` }] : [];
+    setItems([header, ...earlier, ...shown, ...notesAfter]);
     setStaticKey((k) => k + 1);
     if (interrupted) {
       const prompt = "Continue where you left off.";
@@ -1585,6 +1651,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         alwaysAllow.current.clear();
         setUsage(null);
         session.current = null; // the old chat stays saved; this starts a new one
+        viewPending.current = [];
         stdout.write("\x1b[2J\x1b[3J\x1b[H");
         setItems([{ id: id(), kind: "header", model, loggedIn: !!auth.key, keySource: auth.source }]);
         setStaticKey((k) => k + 1);
@@ -1949,6 +2016,25 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     else void sendChat(text);
   };
 
+  /** Ctrl+Enter / Ctrl+S: stop the running turn and send this message now. */
+  const interruptedForMessage = useRef(false);
+  const sendNow = (value: string) => {
+    const text = value.replace(/\s+$/, "");
+    if (!text.trim()) return;
+    if (!working || !abortRef.current || text.startsWith("/")) {
+      submitChat(value);
+      return;
+    }
+    setHistory((h) => (h[h.length - 1] === text ? h : [...h, text]));
+    setHistIdx(null);
+    setEditor(EMPTY);
+    queueRef.current.unshift({ text, source: "user" });
+    syncQueueLen();
+    interruptedForMessage.current = true;
+    info(`⏎ Interrupting the current turn to send: ${clip(text, 60)}`);
+    abortRef.current.abort();
+  };
+
   const onSpecialKey = (key: Key, _input: string, state: EditorState): boolean => {
     if (mode.type === "login") {
       if (key.escape) {
@@ -1982,7 +2068,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       }
       return false;
     }
-    if (key.upArrow && onFirstLine(state) && history.length) {
+    // ↑/↓ move through the rows of the draft; history only from its first/last row.
+    const cols = Math.max(4, Math.max(10, size.columns - 4) - labelWidth("› "));
+    if (key.upArrow && onFirstVisualRow(state, cols) && history.length) {
       const idx = histIdx === null ? history.length - 1 : Math.max(0, histIdx - 1);
       if (histIdx === null) setDraft(state.value);
       setHistIdx(idx);
@@ -1990,7 +2078,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       setEditor({ value: v, cursor: v.length });
       return true;
     }
-    if (key.downArrow && onLastLine(state) && histIdx !== null) {
+    if (key.downArrow && onLastVisualRow(state, cols) && histIdx !== null) {
       const idx = histIdx + 1;
       const v = idx >= history.length ? draft : history[idx]!;
       setHistIdx(idx >= history.length ? null : idx);
@@ -2406,6 +2494,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
               escArmed.current = false;
             }}
             onSubmit={mode.type === "login" ? (v) => void submitLogin(v) : submitChat}
+            onSubmitNow={mode.type === "login" ? undefined : sendNow}
             onSpecialKey={onSpecialKey}
             mask={mode.type === "login"}
             label={mode.type === "login" ? "API key: " : theme.brand("› ")}
@@ -2711,7 +2800,8 @@ function helpText(): string {
   const keys: [string, string][] = [
     ["Enter", "Send · while the agent works, messages reach it at its next step (queued if tools are off) and most /commands run at once"],
     ["Shift+Enter or \\ then Enter", "New line (Alt+Enter / Ctrl+J also work)"],
-    ["↑ / ↓", "Previous / next input"],
+    ["↑ / ↓", "Move through the rows of your draft · from its first/last row: previous / next input"],
+    ["Ctrl+Enter / Ctrl+S", "Send now: stop the running turn and send what you typed"],
     ["Tab", "Complete the highlighted /command · select in pickers"],
     ["Ctrl+A / Ctrl+E", "Start / end of line"],
     ["Ctrl+U / Ctrl+K / Ctrl+W", "Delete to line start / to line end / previous word"],

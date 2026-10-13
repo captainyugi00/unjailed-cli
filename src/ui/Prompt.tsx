@@ -1,6 +1,7 @@
 import React, { useRef } from "react";
 import { Box, Text, useInput, type Key } from "ink";
 import { theme } from "../theme.js";
+import stringWidth from "string-width";
 import { editorViewport } from "./stream-buffer.js";
 
 export interface EditorState {
@@ -14,6 +15,8 @@ export interface PromptProps {
   onSubmit: (value: string) => void;
   /** Return true if the key was consumed (e.g. by the slash menu or history). */
   onSpecialKey?: (key: Key, input: string, state: EditorState) => boolean;
+  /** Ctrl+Enter (or Ctrl+S): send now, interrupting whatever is running. */
+  onSubmitNow?: (value: string) => void;
   mask?: boolean;
   placeholder?: string;
   isActive: boolean;
@@ -24,6 +27,74 @@ export interface PromptProps {
 
 const isShiftEnter = (input: string, key: Key) =>
   (key.return && (key.shift || key.meta)) || input === "[27;2;13~" || input === "[13;2u";
+
+/** Ctrl+Enter as reported by the kitty protocol (CSI 13;5u) or xterm's
+ *  modifyOtherKeys (CSI 27;5;13~); Ctrl+S works in every terminal. */
+export const isSubmitNow = (input: string, key: Key) =>
+  (key.return && key.ctrl) || /^\x1b?\[(27;5;13~|13;5u)$/.test(input) || (key.ctrl && input === "s");
+
+/** Visible width of the label in front of the input (it may carry color codes). */
+export const labelWidth = (label: string) => stringWidth(label.replace(/\x1b\[[0-9;]*m/g, ""));
+
+/** The rows the editor shows for `value` at `columns` (same wrapping as editorViewport). */
+function visualRows(value: string, columns: number): Array<{ start: number; end: number }> {
+  const width = Math.max(4, columns - 1);
+  const rows: Array<{ start: number; end: number }> = [];
+  let start = 0;
+  let cells = 0;
+  let offset = 0;
+  for (const ch of value) {
+    if (ch === "\n") {
+      rows.push({ start, end: offset });
+      start = offset + 1;
+      cells = 0;
+    } else {
+      const size = stringWidth(ch);
+      if (cells + size > width) {
+        rows.push({ start, end: offset });
+        start = offset;
+        cells = 0;
+      }
+      cells += size;
+    }
+    offset += ch.length;
+  }
+  rows.push({ start, end: offset });
+  return rows;
+}
+
+function rowOf(rows: Array<{ start: number; end: number }>, cursor: number): number {
+  for (let i = rows.length - 1; i >= 0; i--) if (cursor >= rows[i]!.start) return i;
+  return 0;
+}
+
+/** Is the cursor on the first / last row the editor shows (wrapped rows count)? */
+export function onFirstVisualRow(s: EditorState, columns: number): boolean {
+  return rowOf(visualRows(s.value.slice(0, s.cursor + 1), columns), s.cursor) === 0;
+}
+export function onLastVisualRow(s: EditorState, columns: number): boolean {
+  const rows = visualRows(s.value, columns);
+  return rowOf(rows, s.cursor) === rows.length - 1;
+}
+
+/** Move the cursor one shown row up or down, keeping its column. */
+export function moveVisual(s: EditorState, columns: number, dir: -1 | 1): EditorState {
+  const rows = visualRows(s.value, columns);
+  const at = rowOf(rows, s.cursor);
+  const target = at + dir;
+  if (target < 0 || target >= rows.length) return s;
+  const col = stringWidth(s.value.slice(rows[at]!.start, s.cursor));
+  const row = rows[target]!;
+  let cursor = row.start;
+  let cells = 0;
+  for (const ch of s.value.slice(row.start, row.end)) {
+    const size = stringWidth(ch);
+    if (cells + size > col) break;
+    cells += size;
+    cursor += ch.length;
+  }
+  return { ...s, cursor };
+}
 
 function lineBounds(value: string, cursor: number) {
   const start = value.lastIndexOf("\n", cursor - 1) + 1;
@@ -57,7 +128,9 @@ function insert(s: EditorState, text: string): EditorState {
   return { value: s.value.slice(0, s.cursor) + text + s.value.slice(s.cursor), cursor: s.cursor + text.length };
 }
 
-export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onSpecialKey, mask, placeholder, isActive, label, width = 80, maxRows = 4 }: PromptProps) {
+export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onSubmitNow, onSpecialKey, mask, placeholder, isActive, label, width = 80, maxRows = 4 }: PromptProps) {
+  const prefix = label ?? "› ";
+  const textColumns = Math.max(4, width - labelWidth(prefix));
   // Several key events can arrive in one batch (e.g. a paste followed by an arrow key) before
   // React re-renders, so edits build on the latest state kept here, not the possibly stale prop.
   const latest = useRef(propState);
@@ -92,6 +165,10 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
         if (chunk) onChange(insert(state, mask ? chunk.replace(/\s+/g, "") : chunk));
         return;
       }
+      if (onSubmitNow && !mask && isSubmitNow(input, key)) {
+        onSubmitNow(state.value);
+        return;
+      }
       if (onSpecialKey?.(key, input, state)) return;
       const { value, cursor } = state;
 
@@ -124,8 +201,8 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
       if (key.rightArrow) return onChange({ ...state, cursor: Math.min(value.length, cursor + 1) });
       if (key.home) return onChange({ ...state, cursor: lineBounds(value, cursor).start });
       if (key.end) return onChange({ ...state, cursor: lineBounds(value, cursor).end });
-      if (key.upArrow) return onChange(moveVertical(state, -1));
-      if (key.downArrow) return onChange(moveVertical(state, 1));
+      if (key.upArrow) return onChange(moveVisual(state, textColumns, -1));
+      if (key.downArrow) return onChange(moveVisual(state, textColumns, 1));
       // Most terminals send DEL (0x7f) for Backspace, which Ink reports as `delete`.
       if (key.backspace || key.delete) {
         if (cursor === 0) return;
@@ -143,15 +220,16 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
   );
 
   const state = propState;
-  const prefix = label ?? "› ";
-  const pad = " ".repeat(prefix.length);
-  const viewport = editorViewport(state.value, state.cursor, Math.max(4, width - prefix.length), maxRows);
+  // Measure the label by what it shows, not its color codes: counting the
+  // codes indented every continuation row far to the right.
+  const pad = " ".repeat(labelWidth(prefix));
+  const viewport = editorViewport(state.value, state.cursor, textColumns, maxRows);
   const lines = viewport.lines.map((line) => renderWithCursor(mask ? "•".repeat(line.text.length) : line.text, line.cursor ?? 0, isActive && line.cursor !== null, state.value ? undefined : placeholder));
   return (
     <Box flexDirection="column">
       {lines.map((l, i) => (
         <Text key={i} wrap="truncate-end">
-          {i === 0 ? theme.brand(prefix) : pad}
+          {i === 0 ? (prefix.includes("\x1b") ? prefix : theme.brand(prefix)) : pad}
           {l}
         </Text>
       ))}
