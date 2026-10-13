@@ -169,6 +169,8 @@ export interface Usage {
   total: number;
   /** Hidden reasoning tokens (part of completion), when the server reports them. */
   reasoning?: number;
+  /** Prompt tokens served from the provider's cache (billed at the cached rate). */
+  cached?: number;
 }
 
 export interface RetryInfo {
@@ -213,14 +215,15 @@ export interface AgentStreamResult {
 
 /** Pull an OpenAI-style usage object out of a stream chunk or completion. */
 function parseUsage(raw: unknown): Usage | undefined {
-  const u = raw as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } } | null | undefined;
+  const u = raw as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number }; prompt_tokens_details?: { cached_tokens?: number } } | null | undefined;
   if (!u || typeof u !== "object") return undefined;
   const prompt = Number(u.prompt_tokens ?? 0);
   const completion = Number(u.completion_tokens ?? 0);
   const total = Number(u.total_tokens ?? prompt + completion);
   if (!prompt && !completion && !total) return undefined;
   const reasoning = Number(u.completion_tokens_details?.reasoning_tokens ?? 0);
-  return reasoning > 0 ? { prompt, completion, total, reasoning } : { prompt, completion, total };
+  const cached = Number(u.prompt_tokens_details?.cached_tokens ?? 0);
+  return { prompt, completion, total, ...(reasoning > 0 ? { reasoning } : {}), ...(cached > 0 ? { cached } : {}) };
 }
 
 /** Errors the server reports inside a response body (an SSE `error` event or

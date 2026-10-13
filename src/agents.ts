@@ -1,4 +1,4 @@
-import { agentTurn, type AgentHandlers, type AgentMessage, type Backoff, type RetryInfo } from "./api.js";
+import { agentTurn, type AgentHandlers, type AgentMessage, type Backoff, type RetryInfo, type Usage } from "./api.js";
 import type { ToolDef } from "./tools.js";
 import { WORKFLOW_CONCURRENCY, WORKFLOW_MAX_AGENTS } from "./workflow.js";
 
@@ -70,6 +70,8 @@ export interface SubagentActivity {
   /** Requests sent (retries included) and transient failures waited out. */
   requests: number;
   retries: number;
+  /** USD spent so far (finished requests), when prices are known. */
+  cost?: number;
 }
 
 export interface SubagentRun {
@@ -90,6 +92,10 @@ export interface SubagentRun {
   onRetry?: (info: RetryInfo) => void;
   /** Retry pacing (tests use a fast one). */
   backoff?: Backoff;
+  /** Price of one request's usage (undefined when prices are unknown). */
+  costOf?: (usage: Usage) => number | undefined;
+  /** Every usage report, for the session's spend log. */
+  onUsage?: (usage: Usage) => void;
 }
 
 export interface SubagentResult {
@@ -128,6 +134,9 @@ export async function runSubagent(run: SubagentRun): Promise<SubagentResult> {
       emit(act.state === "thinking" ? undefined : "thinking");
     },
     onUsage: (u) => {
+      run.onUsage?.(u);
+      const c = run.costOf?.(u);
+      if (c !== undefined) act.cost = (act.cost ?? 0) + c;
       act.tokensIn += u.prompt;
       completion += u.completion;
       // Prefer the server's reasoning count; otherwise keep the estimate.

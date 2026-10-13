@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Box, renderToString, Text, useApp, useInput, useStdout, type Key } from "ink";
 import {
+  type Usage,
   AbortedError,
   ApiError,
   agentTurn,
@@ -21,6 +22,7 @@ import { recoverAuth, tryClearEnvKeyWindows } from "../auth-recovery.js";
 import { createSkill, loadSkills, projectSkillsDir, skillsSystemPrompt, userSkillsDir, type Skill } from "../skills.js";
 import { agentSystemPrompt } from "../system-prompt.js";
 import { DEFAULT_MODEL, REASONING_TIMEOUT_MS } from "../constants.js";
+import { costOf, costParts, formatCost, loadPrices, type PriceList } from "../pricing.js";
 import { renderMarkdown } from "../markdown.js";
 import { theme, tone } from "../theme.js";
 import { Header } from "./Header.js";
@@ -35,6 +37,7 @@ import { ActivityBar, addTurnToSession, agentsTable, emptySessionStats, emptyTur
 import { clip, describeAction, formatToolBlock, parseArgs, toolKind, toolSummary, toolTitle } from "./tool-format.js";
 import { revealForApproval, sanitizeForDisplay } from "./sanitize.js";
 import { Thinking } from "./Thinking.js";
+import { UsagePanel, type PeriodSpend, type UsageView } from "./UsagePanel.js";
 import {
   deleteSession,
   findSession,
@@ -257,6 +260,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   const sessionStats = useRef<SessionStats>(emptySessionStats());
   /** Ctrl+T: the detailed agents table instead of the compact panel. */
   const [agentsExpanded, setAgentsExpanded] = useState(false);
+  /** /usage: the live usage panel (non-blocking) and its data sources. */
+  const [usageOpen, setUsageOpen] = useState(false);
+  const usageData = useRef<{ periods: PeriodSpend[]; prices: UsageView["prices"] }>({ periods: [], prices: "loading" });
   const goalRef = useRef<Goal | null>(null);
   const loopRef = useRef<LoopState | null>(null);
   const loopSeq = useRef(0);
@@ -315,6 +321,29 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [size.columns, size.rows]);
+
+  // Model prices for live costs (from the site's public catalog; cached a day).
+  const prices = useRef<PriceList | null>(null);
+  useEffect(() => {
+    void loadPrices(baseUrl).then((p) => { prices.current = p; });
+  }, [baseUrl]);
+  /** USD for one request by `forModel`; undefined when its price is unknown. */
+  const priceOf = (forModel: string) => prices.current?.[forModel];
+  /** The spend log: every usage report the API sends (main agent, subagents,
+   *  plan drafts, goal checks) is priced and added here as it arrives. */
+  const recordUsage = (forModel: string, u: Usage) => {
+    const st = sessionStats.current;
+    const next = { ...st, billedRequests: (st.billedRequests ?? 0) + 1, cachedTokens: (st.cachedTokens ?? 0) + (u.cached ?? 0) };
+    const p = priceOf(forModel);
+    if (p) {
+      const parts = costParts(p, u);
+      next.costIn = (st.costIn ?? 0) + parts.input;
+      next.costCached = (st.costCached ?? 0) + parts.cached;
+      next.costOut = (st.costOut ?? 0) + parts.output;
+      next.cost = (st.cost ?? 0) + parts.input + parts.cached + parts.output;
+    }
+    sessionStats.current = next;
+  };
 
   // On startup, quietly make sure the saved model still exists.
   useEffect(() => {
@@ -560,11 +589,23 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     let finishedAgentTokens = 0; // subagents that are done, even after their group leaves the panel
     let reportedReasoning = 0;
     let reasoningChars = 0; // streamed thinking since the last usage report
+    const turnModel = model;
+    const price = () => priceOf(turnModel);
+    const costFor = (u: Usage) => costOf(price(), u);
+    let finishedAgentCost = 0;
     const refreshTokens = () => {
       main.tokens = completionTokens + Math.round(streamedChars / 4);
       main.reasoning = reportedReasoning + Math.round(reasoningChars / 4);
       const running = live.current.groups.reduce((n, g) => n + g.tasks.reduce((m, t) => m + (t.status === "running" ? t.tokens ?? 0 : 0), 0), 0);
       live.current.activity.tokens = main.tokens + finishedAgentTokens + running;
+      // Cost: finished requests at their real usage, plus output still
+      // streaming at the output rate, so the number moves while it works.
+      const p = price();
+      if (p) {
+        const runningCost = live.current.groups.reduce((n, g) => n + g.tasks.reduce((m, t) => m + (t.status === "running" ? t.cost ?? 0 : 0), 0), 0);
+        const streaming = (Math.round(streamedChars / 4) * p.output) / 1_000_000;
+        live.current.activity.cost = (main.cost ?? 0) + finishedAgentCost + runningCost + streaming;
+      }
     };
 
     const sync = () => {
@@ -666,6 +707,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       onUsage: (u) => {
         gotUsage = true;
         stats.contextTokens = u.prompt;
+        const c = costFor(u);
+        if (c !== undefined) main.cost = (main.cost ?? 0) + c;
+        recordUsage(turnModel, u);
         completionTokens += u.completion;
         main.tokensIn = (main.tokensIn ?? 0) + u.prompt;
         // The server's reasoning count wins over the estimate from streamed thinking.
@@ -767,6 +811,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             return r;
           },
           describeCall: (name, args) => toolTitle(name, parseArgs(args), 50).replace(/\x1b\[[0-9;]*m/g, ""),
+          costOf: costFor,
+          onUsage: (u) => recordUsage(turnModel, u),
           onTool: (name, args) => {
             countTool(name);
             if (verboseRef.current) push({ kind: "info", text: `↳ ${task.label}: ${toolTitle(name, parseArgs(args), Math.max(30, size.columns - task.label.length - 10))}` });
@@ -781,6 +827,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
             task.toolUses = a.toolCalls;
             task.requests = a.requests;
             task.retries = a.retries;
+            task.cost = a.cost;
             refreshTokens();
           },
         });
@@ -793,6 +840,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       } finally {
         task.endedAt = Date.now();
         finishedAgentTokens += task.tokens ?? 0;
+        finishedAgentCost += task.cost ?? 0;
         refreshTokens();
       }
     };
@@ -924,7 +972,12 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
 
       // ── plan mode: mutating jobs get a numbered plan + explicit approval first ──
       if (useTools && planMode === "on" && (toolsMode === "cmds" || toolsMode === "yolo") && source === "user") {
-        const approved = await planFirst(agentHistory, ctrl);
+        const approved = await planFirst(agentHistory, ctrl, (u) => {
+          recordUsage(turnModel, u);
+          const c = costFor(u);
+          if (c !== undefined) main.cost = (main.cost ?? 0) + c;
+          refreshTokens();
+        });
         if (!approved) {
           // A finished turn (not an interrupted one): nothing to resume later.
           pendingRef.current = null;
@@ -1017,7 +1070,9 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     const elapsed = formatElapsed(Date.now() - started);
     const tokens = live.current.activity.tokens;
     const tools = turnEvents.length;
-    const summary = [elapsed, tools ? `${tools} tool call${tools === 1 ? "" : "s"}` : "", tokens ? `↓ ${formatTokens(tokens)} tokens` : ""].filter(Boolean).join(" · ");
+    refreshTokens();
+    const turnCost = live.current.activity.cost;
+    const summary = [elapsed, tools ? `${tools} tool call${tools === 1 ? "" : "s"}` : "", tokens ? `↓ ${formatTokens(tokens)} tokens` : "", turnCost ? formatCost(turnCost) : ""].filter(Boolean).join(" · ");
     if (outcome === "stopped" && interruptedForMessage.current) push({ kind: "turn", tone: "warn", text: `Interrupted to send your message after ${summary}` });
     else if (outcome === "stopped") push({ kind: "turn", tone: "warn", text: `Stopped by you after ${summary}` });
     else if (outcome === "error") push({ kind: "turn", tone: "error", text: `${errMsg}  (${summary})` });
@@ -1091,7 +1146,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     runningTurn.current = true;
     try {
       const reply = [...messages.current].reverse().find((m) => m.role === "assistant")?.content ?? "";
-      const verdict = await evaluateGoal({ baseUrl, key: auth.key!, model }, g, goalEvidence(prompt, events, reply), ctrl.signal);
+      const verdict = await evaluateGoal({ baseUrl, key: auth.key!, model }, g, goalEvidence(prompt, events, reply), ctrl.signal, (u) => recordUsage(model, u));
       const turns = g.turns + 1;
       if (verdict.met) {
         success(`◎ Goal met after ${turns} turn${turns === 1 ? "" : "s"} (${formatElapsed(Date.now() - g.startedAt)}): ${verdict.reason}.`);
@@ -1634,6 +1689,67 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     else info("Verbose off — thinking is summarised as \"Thought for …\" and tool output is previewed.");
   };
 
+  // ---------- /usage ----------
+
+  /** Spend across saved chats by last activity: today, 7 and 30 days, all. */
+  const spendPeriods = (): PeriodSpend[] => {
+    const now = Date.now();
+    const day = 86_400_000;
+    const startOfToday = new Date(new Date().toDateString()).getTime();
+    const current = session.current?.id;
+    const rows = [
+      { label: "Today", from: startOfToday },
+      { label: "Last 7 days", from: now - 7 * day },
+      { label: "Last 30 days", from: now - 30 * day },
+      { label: "All chats", from: 0 },
+    ].map((p) => ({ ...p, cost: 0, chats: 0, unpriced: 0 }));
+    let metas: SessionMeta[] = [];
+    try { metas = sessionsEnabled() ? listSessions() : []; } catch { /* unreadable: show this chat only */ }
+    const add = (updated: number, cost: number | undefined) => {
+      for (const r of rows) {
+        if (updated < r.from) continue;
+        r.chats++;
+        if (cost === undefined) r.unpriced++;
+        else r.cost += cost;
+      }
+    };
+    // Other chats from disk; this chat is added live by usageView.
+    for (const m of metas) if (m.id !== current) add(m.updated, typeof m.stats?.cost === "number" ? m.stats.cost : undefined);
+    return rows.map(({ label, cost, chats, unpriced }) => ({ label, cost, chats, unpriced }));
+  };
+
+  const usageCommand = () => {
+    if (usageOpen) {
+      setUsageOpen(false);
+      return;
+    }
+    usageData.current = { periods: spendPeriods(), prices: prices.current ? "cached" : "loading" };
+    setUsageOpen(true);
+    // The rates come live from the API's public catalog each time it opens.
+    void loadPrices(baseUrl, undefined, true).then((p) => {
+      if (p) prices.current = p;
+      usageData.current = { ...usageData.current, prices: p ? "live" : prices.current ? "cached" : "unknown" };
+    });
+  };
+
+  const usageView = (): UsageView => ({
+    // Mid-turn, the running turn's tokens are added (costs are already live).
+    session: runningTurn.current && live.current.all ? addTurnToSession(sessionStats.current, live.current, Date.now() - live.current.activity.startedAt) : sessionStats.current,
+    turnCost: live.current.activity.cost,
+    running: runningTurn.current,
+    model,
+    price: priceOf(model),
+    prices: usageData.current.prices,
+    source: (() => { try { return new URL(baseUrl).host + "/models.json"; } catch { return ""; } })(),
+    // This chat's live spend is part of every period (it is active now).
+    periods: usageData.current.periods.map((p) => {
+      const active = messages.current.length > 0 || (sessionStats.current.billedRequests ?? 0) > 0;
+      if (!active) return p;
+      const c = sessionStats.current.cost;
+      return { ...p, chats: p.chats + 1, cost: p.cost + (c ?? 0), unpriced: p.unpriced + (c === undefined ? 1 : 0) };
+    }),
+  });
+
   // ---------- /stats ----------
 
   const statsCommand = () => {
@@ -1740,6 +1856,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
         return verboseCommand(cmd.arg);
       case "stats":
         return statsCommand();
+      case "usage":
+        return usageCommand();
       case "fun":
         return funCommand(cmd.arg);
       case "api":
@@ -1801,9 +1919,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       ].join("\n") });
       return;
     }
+    const cost = sessionStats.current.cost;
     push({ kind: "plain", text: [
       `${theme.dim("Context  ")} ${usage.approx ? "~" : ""}${formatTokens(usage.ctx)} tokens${usage.approx ? theme.dim(" (estimated)") : ""}`,
       `${theme.dim("Last turn")} ${formatTokens(usage.prompt)} in · ${formatTokens(usage.completion)} out`,
+      `${theme.dim("Cost     ")} ${cost !== undefined ? `${formatCost(cost)} this chat` : theme.dim("unknown (no price list for this API)")}${theme.dim(" · /usage for details")}`,
       `${theme.dim("Messages ")} ${count}`,
       `${theme.dim("Model    ")} ${model}`,
     ].join("\n") });
@@ -1812,7 +1932,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
   // ---------- /auto (bypass) & /plan ----------
 
   /** Plan mode: before mutating work, get a numbered plan and explicit yes/no. */
-  const planFirst = async (history: AgentMessage[], ctrl: AbortController): Promise<boolean> => {
+  const planFirst = async (history: AgentMessage[], ctrl: AbortController, onUsage?: (u: Usage) => void): Promise<boolean> => {
     setPhase("thinking", "drafting a plan");
     let plan = "";
     // A draft that only reasons past the deadline is retried once at low effort.
@@ -1824,6 +1944,7 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
           { role: "user", content: "Before doing anything: reply with ONLY a short numbered plan (max 8 steps, one line each) for exactly this task. No prose before or after. You will not execute anything yet." },
         ] as ChatMessage[], {
           onToken: (t) => { plan += t; },
+          onUsage,
         }, ctrl.signal, { effort: attempt ? "low" : effort, reasoningTimeoutMs: attempt >= 2 ? REASONING_TIMEOUT_MS * 2 : undefined });
         break;
       } catch (err) {
@@ -2280,6 +2401,11 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       if (key.ctrl && input === "c") { planAnswerRef.current(false); abortRef.current?.abort(); }
       return;
     }
+    // The usage panel closes on Esc (or Ctrl+C) before anything else reacts.
+    if (usageOpen && (key.escape || (key.ctrl && input === "c")) && !menuOpen) {
+      setUsageOpen(false);
+      return;
+    }
     // With the slash menu open, Esc only closes the menu.
     if (key.escape && abortRef.current && (turnActive || busy) && !menuOpen && (mode.type === "chat" || mode.type === "login")) {
       // Two-stage: first Esc arms, second Esc actually stops the running turn
@@ -2492,7 +2618,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
     (menuOpen ? Math.min(10, slashMatches.length + 2) : 0) +
     (mode.type === "picker" || mode.type === "sessions" || mode.type === "skills" ? 13 : mode.type === "effort" || mode.type === "tool-permissions" ? 7 : 0) +
     (approval ? approval.body.length + 7 : 0) +
-    (flash ? 1 : 0);
+    (flash ? 1 : 0) +
+    (usageOpen ? 17 : 0);
   const budget = Math.max(2, streamingRowBudget(size.rows, width, editor.value, false, mode.type === "plan-approve") - reserved);
   const thinkingRows = stream?.thinking?.trim() ? Math.max(2, Math.min(8, Math.floor(budget / 2))) : 0;
   const liveRows = Math.max(1, budget - thinkingRows - (thinkingRows ? 1 : 0));
@@ -2528,6 +2655,8 @@ export function App({ startup }: { startup?: "continue" | "resume" } = {}) {
       )}
 
       {approval && <ApprovalBox approval={approval} width={width} drafting={!!editor.value} />}
+
+      {usageOpen && <UsagePanel read={usageView} width={width} />}
 
       {mode.type === "picker" && (
         <Box flexDirection="column" marginTop={1}>
@@ -2748,7 +2877,11 @@ function Footer({ width, model, effort, skills, toolsMode, autoMode, planMode, l
   if (planMode === "on" && (toolsMode === "cmds" || toolsMode === "yolo")) parts.push([theme.dim("plan"), 3]);
   if (effort !== "auto") parts.push([theme.dim(`effort ${effort}`), 2]);
   if (verbose) parts.push([tone.thinking("verbose"), 5]);
-  if (verbose && session && session.turns) parts.push([theme.dim(`Σ ↑${formatTokens(session.tokensIn)} ↓${formatTokens(session.tokens)} · ${session.tools} tools`), 3]);
+  const spent = session?.cost && session.cost > 0 ? session.cost : 0;
+  // Verbose: one Σ chip with tokens, tools and cost. Otherwise just the cost,
+  // always shown once something was spent.
+  if (verbose && session && session.turns) parts.push([theme.dim(`Σ ↑${formatTokens(session.tokensIn)} ↓${formatTokens(session.tokens)} · ${session.tools} tools`) + (spent ? theme.dim(" · ") + theme.ok(formatCost(spent)) : ""), 7]);
+  else if (spent) parts.push([theme.ok(formatCost(spent)), 7]);
   if (skills) parts.push([theme.dim(`${skills} skill${skills === 1 ? "" : "s"}`), 2]);
   if (goal) parts.push([tone.goal(`◎ goal ${goal.turns}/${goal.maxTurns}`), 8]);
   if (loop) parts.push([tone.agent(`↻ loop${loop.nextAt ? ` ${formatDuration(Math.max(0, loop.nextAt - Date.now()))}` : loop.lastReason === "paused" ? " paused" : " running"}`), 8]);

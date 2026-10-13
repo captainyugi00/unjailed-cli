@@ -72,6 +72,7 @@ Type `/` to open the command menu. Use ↑/↓ to move, Enter to run the highlig
 | `/workflow <name> [args]` | Run a saved multi-agent workflow (see [Subagents and workflows](#subagents-and-workflows)). Tools must be on. Args are parsed as JSON when they are valid JSON, otherwise passed as text. `/workflow new <name>` creates one from a template in this project; add `--user` to create it in your user folder. `/workflow` with no name lists them. |
 | `/workflows` | List saved workflows. |
 | `/verbose [on\|off]` | Show what the model is thinking: its reasoning streams into the transcript as dimmed `∴` blocks, each subagent's tool calls are listed, and tool results show up to 40 lines. Ctrl+O toggles. Remembered between runs. |
+| `/usage` | A live spend dashboard that stays open while you type and while the agent works: this chat's cost split into input / cached input / output, the running turn, today, the last 7 and 30 days and all chats, and the current model's rates. Esc closes it. |
 | `/stats` | Requests (and retries), time to first token, speed, context size, input/output/reasoning tokens, tools by kind, agents and recoveries for the last turn, plus session totals. |
 | `/agents` | Show every agent of the last turn (main agent, subagents, workflow agents): status, time, tool uses, and input/output/reasoning tokens. |
 | `/resume` | Pick up a previous chat from the current folder (or from every folder if this one has none). In the picker, Enter resumes, `a` shows every folder, and `d` then `y` deletes. `/resume 2` or `/resume <id>` jumps straight to one. |
@@ -124,6 +125,17 @@ reported by the server, or estimated from streamed thinking). States are
 color-coded: thinking, writing, running a tool, waiting for approval,
 reconnecting, done, failed. Columns drop out on narrow terminals. `/agents`
 prints the same table for the last turn after it ends.
+
+**Costs.** Every request's token usage, as reported by the API, is priced at
+the rates in the public catalog (`unjailedai.com/models.json`, refreshed daily
+and every time `/usage` opens): fresh input, cached input and output each at
+their own rate. The cost appears live in the status line while the agent works
+(including subagents, workflow agents, plan drafts and goal checks), in each
+turn's summary line, per agent in the agents table, in the footer for the whole
+chat, and in `/usage`, `/stats` and `/context`. The wallet balance itself is
+only available on the dashboard (unjailedai.com/dashboard); the API has no
+balance endpoint. With a custom `UNJAILED_BASE_URL` that has no price list,
+token counts are shown without costs.
 
 **Live stats (verbose).** While `/verbose` is on, a stats panel under the
 status line updates in real time: requests and retries, time to first token,

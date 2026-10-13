@@ -247,6 +247,12 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const log = (msg) => console.log(`${new Date().toISOString().slice(11, 19)} ${req.method} ${url.pathname} ${msg}`);
 
+  // Public price list, like unjailedai.com/models.json (USD per 1M tokens).
+  if (req.method === "GET" && url.pathname === "/models.json") {
+    log("200");
+    return json(res, 200, { count: MODELS.length, models: MODELS.map((id, i) => ({ id, pricing: { input: 0.75 + i * 0.1, cachedInput: 0.08, output: 3 + i, currency: "USD", unit: "per_million_tokens" } })) });
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/models") {
     if (!authed(req, res)) return log("401");
     log("200");
@@ -276,7 +282,7 @@ const server = http.createServer(async (req, res) => {
       if (scenario.drop) { await sleep(100); res.destroy(); return; }
       (scenario.toolCalls ?? []).forEach((c, index) => chunk({ tool_calls: [{ index, id: c.id, type: "function", function: { name: c.name, arguments: c.args } }] }));
       chunk({}, scenario.toolCalls?.length ? "tool_calls" : "stop");
-      res.write(`data: ${JSON.stringify({ id: "mock", choices: [], usage: { prompt_tokens: 1200 + body.messages.length * 50, completion_tokens: 40, total_tokens: 1240 } })}\n\n`);
+      res.write(`data: ${JSON.stringify({ id: "mock", choices: [], usage: { prompt_tokens: 1200 + body.messages.length * 50, completion_tokens: 40, total_tokens: 1240, prompt_tokens_details: { cached_tokens: 1000 } } })}\n\n`);
       res.write("data: [DONE]\n\n");
       res.end();
       return;

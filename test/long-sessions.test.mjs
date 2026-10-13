@@ -102,6 +102,7 @@ test("terminal keeps activity visible after text, waits for approval, and preser
   const oldFetch = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/models.json")) return Response.json({ models: [] });
     if (String(url).endsWith("/models")) return Response.json({ data: [{ id: "kimi-k3" }] });
     const request = { body: JSON.parse(init.body), controller: null };
     const body = new ReadableStream({ start(controller) { request.controller = controller; } });
@@ -176,6 +177,7 @@ test('a completed tool and its task survive a model error before any assistant p
   const oldFetch=globalThis.fetch;
   let calls=0;
   globalThis.fetch=async (url) => {
+    if(String(url).endsWith('/models.json'))return Response.json({models:[]});
     if(String(url).endsWith('/models'))return Response.json({data:[{id:'kimi-k3'}]});
     calls++;
     if(calls===1)return Response.json({choices:[{message:{tool_calls:[{id:'read-before-error',function:{name:'read_file',arguments:JSON.stringify({path:file})}}]}}]});

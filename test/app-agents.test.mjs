@@ -409,3 +409,21 @@ test("↑ history keeps working past a recalled slash command", async () => {
     assert.match(ui.lastFrame(), /› first prompt here/);
   } finally { ui.unmount(); }
 });
+
+test("/usage opens mid-run without blocking, updates live, and costs show in the summary and footer", async () => {
+  writeConfig({ tools: "yolo", plan: false, fx: false, verbose: false });
+  const ui = render(React.createElement(App));
+  try {
+    await sleep(400); // prices load from the mock's /models.json
+    await type(ui, "mock:batch go");
+    await waitFor(ui, /Bash\(sleep 1/, "turn running");
+    await type(ui, "/usage");
+    await waitFor(ui, /Usage[\s\S]*This chat[\s\S]*This turn[\s\S]*Today[\s\S]*rates per 1M tokens/, "panel open while the agent works");
+    await type(ui, "typed while the panel is open");
+    await waitFor(ui, /Sent to the agent/, "input still works with the panel open");
+    await waitFor(ui, /Worked for[^\n]*\$0\.0\d+/, "turn summary includes the cost", 15_000);
+    await waitFor(ui, /◆ glm-5\.3[^\n]*\$0\.0\d+/, "footer shows the chat's cost");
+    ui.stdin.write("\x1b"); await sleep(150);
+    assert.doesNotMatch(ui.lastFrame(), /Esc closes · keeps updating/, "Esc closes it");
+  } finally { ui.unmount(); }
+});

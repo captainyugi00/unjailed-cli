@@ -1,4 +1,4 @@
-import { ApiError, streamChatRetry, type ChatMessage } from "./api.js";
+import { ApiError, streamChatRetry, type ChatMessage, type Usage } from "./api.js";
 import { REASONING_TIMEOUT_MS } from "./constants.js";
 import type { ToolEvent } from "./context.js";
 
@@ -92,6 +92,7 @@ export async function evaluateGoal(
   goal: Goal,
   evidence: string,
   signal: AbortSignal,
+  onUsage?: (usage: Usage) => void,
 ): Promise<GoalVerdict> {
   const messages: ChatMessage[] = [
     { role: "system", content: EVALUATOR_SYSTEM },
@@ -103,7 +104,7 @@ export async function evaluateGoal(
   for (let attempt = 0; ; attempt++) {
     try {
       text = "";
-      await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; } }, signal, { effort: "low", reasoningTimeoutMs: attempt ? REASONING_TIMEOUT_MS * 2 ** attempt : undefined });
+      await streamChatRetry(conn.baseUrl, conn.key, conn.model, messages, { onToken: (t) => { text += t; }, onUsage }, signal, { effort: "low", reasoningTimeoutMs: attempt ? REASONING_TIMEOUT_MS * 2 ** attempt : undefined });
       break;
     } catch (err) {
       if (attempt < 2 && err instanceof ApiError && err.code === "reasoning-deadline") continue;

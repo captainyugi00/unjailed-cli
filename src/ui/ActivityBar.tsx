@@ -3,6 +3,7 @@ import { Box, Text } from "ink";
 import stringWidth from "string-width";
 import { colorLevel, theme, tone } from "../theme.js";
 import { clip } from "./tool-format.js";
+import { formatCost } from "../pricing.js";
 
 /**
  * The live status shown for the whole of a turn, so it is always clear what
@@ -25,6 +26,8 @@ export interface Activity {
   startedAt: number;
   /** Output tokens this turn across all agents (reported where available, else estimated). */
   tokens: number;
+  /** USD this turn across all agents, including output still streaming (undefined: prices unknown). */
+  cost?: number;
   retry?: { until: number; attempt: number; reason: string };
 }
 
@@ -50,6 +53,8 @@ export interface AgentStat {
   /** Requests sent and transient failures retried (verbose stats). */
   requests?: number;
   retries?: number;
+  /** USD spent by this agent (undefined: prices unknown). */
+  cost?: number;
 }
 
 /** A task in the panel is one agent's stats. */
@@ -102,6 +107,17 @@ export interface SessionStats {
   reasoning: number;
   tools: number;
   agents: number;
+  /** USD across the session (undefined until a priced request completes):
+   *  the sum of every request's reported usage at the catalog rates. */
+  cost?: number;
+  /** That cost split by fresh input, cached input and output. */
+  costIn?: number;
+  costCached?: number;
+  costOut?: number;
+  /** Prompt tokens served from the provider's cache. */
+  cachedTokens?: number;
+  /** Requests whose usage the server reported. */
+  billedRequests?: number;
 }
 
 export const emptyTurnStats = (): TurnStats => ({ requests: 0, retries: 0, recoveries: 0, ttftTotalMs: 0, ttftCount: 0, tools: {} });
@@ -148,6 +164,7 @@ export function statsLines(view: LiveView, sessionBefore: SessionStats, now: num
     `↓ ${formatTokens(tout)} out`,
     rsn ? tone.thinking(`∴ ${formatTokens(rsn)} thinking`) : "",
     `Σ ${formatTokens(tin + tout)}`,
+    view.activity.cost !== undefined ? `${label("cost")} ${formatCost(view.activity.cost)}` : "",
   ];
   const line3 = [
     `${label("Tools")} ${toolTotal}${kinds.length ? ` (${kinds.join(", ")})` : ""}`,
@@ -161,6 +178,7 @@ export function statsLines(view: LiveView, sessionBefore: SessionStats, now: num
     `↓ ${formatTokens(session.tokens)}`,
     session.reasoning ? `∴ ${formatTokens(session.reasoning)}` : "",
     `${session.tools} tools`,
+    session.cost !== undefined ? formatCost(session.cost) : "",
     `${session.requests} requests`,
     session.retries ? `${session.retries} retried` : "",
   ];
@@ -190,6 +208,13 @@ export function addTurnToSession(session: SessionStats, view: LiveView, elapsedM
     reasoning: session.reasoning + everyone.reduce((n, a) => n + (a.reasoning ?? 0), 0),
     tools: session.tools + Object.values(st.tools).reduce((a, b) => a + b, 0),
     agents: session.agents + agents.length,
+    // Cost is recorded per request as usage arrives (see recordUsage), not per turn.
+    cost: session.cost,
+    costIn: session.costIn,
+    costCached: session.costCached,
+    costOut: session.costOut,
+    cachedTokens: session.cachedTokens,
+    billedRequests: session.billedRequests,
   };
 }
 
@@ -265,6 +290,7 @@ export function statusLine(a: Activity, now: number, frame: string, width: numbe
   const color = PHASE_TONE[a.phase];
   const parts = [formatElapsed(now - a.startedAt)];
   if (a.tokens > 0) parts.push(`↓ ${formatTokens(a.tokens)} tokens`);
+  if (a.cost !== undefined && a.cost > 0) parts.push(formatCost(a.cost));
   const tail = hint ? ` · ${hint}` : "";
   const head = `${frame} ${verb}…`;
   const fixed = stringWidth(head) + stringWidth(` (${parts.join(" · ")}${tail})`);
@@ -302,7 +328,8 @@ export function taskLine(t: AgentStat, now: number, frame: string, width: number
   const time = t.status === "queued" ? "" : formatElapsed((t.endedAt ?? now) - t.startedAt);
   // Narrow terminals drop the token counts, then the state; the label stays readable.
   const tokens = width >= 72 ? io(t) : "";
-  const meta = [time, tokens].filter(Boolean).join(" · ");
+  const cost = width >= 60 && t.cost ? formatCost(t.cost) : "";
+  const meta = [time, tokens, cost].filter(Boolean).join(" · ");
   const room = Math.max(8, width - 4 - stringWidth(meta));
   const label = clip(t.label, Math.min(36, width >= 60 ? Math.floor(room * 0.5) : room));
   const left = room - stringWidth(label) - 2;
@@ -316,26 +343,27 @@ export function taskLine(t: AgentStat, now: number, frame: string, width: number
  */
 export function agentsTable(rows: AgentStat[], width: number, now: number, frame: string): string[] {
   const inner = Math.max(30, width);
-  const cols = { time: 8, tools: 6, tin: 8, tout: 8, rsn: 9 };
-  const show = { rsn: inner >= 96, tin: inner >= 80, tools: inner >= 64 };
-  const fixed = cols.time + (show.tools ? cols.tools : 0) + (show.tin ? cols.tin : 0) + cols.tout + (show.rsn ? cols.rsn : 0);
+  const cols = { time: 8, tools: 6, tin: 8, tout: 8, rsn: 9, cost: 10 };
+  const priced = rows.some((t) => t.cost !== undefined);
+  const show = { rsn: inner >= 106, tin: inner >= 90, tools: inner >= 74, cost: priced && inner >= 60 };
+  const fixed = cols.time + (show.tools ? cols.tools : 0) + (show.tin ? cols.tin : 0) + cols.tout + (show.rsn ? cols.rsn : 0) + (show.cost ? cols.cost : 0);
   const nameW = Math.min(30, Math.max(10, Math.floor((inner - fixed - 3) * 0.4)));
   const stateW = Math.max(6, inner - fixed - nameW - 3);
-  const numbers = (time: string, tools: string, tin: string, tout: string, rsn: string, think = (s: string) => s) =>
-    padTo(time, cols.time, true) + (show.tools ? padTo(tools, cols.tools, true) : "") + (show.tin ? padTo(tin, cols.tin, true) : "") + padTo(tout, cols.tout, true) + (show.rsn ? think(padTo(rsn, cols.rsn, true)) : "");
-  const lines = [theme.dim(padTo("  Agent", nameW + 2) + " " + padTo("Status", stateW) + numbers("Time", "Tools", "↑ In", "↓ Out", "∴ Think"))];
+  const numbers = (time: string, tools: string, tin: string, tout: string, rsn: string, cost: string, think = (s: string) => s) =>
+    padTo(time, cols.time, true) + (show.tools ? padTo(tools, cols.tools, true) : "") + (show.tin ? padTo(tin, cols.tin, true) : "") + padTo(tout, cols.tout, true) + (show.rsn ? think(padTo(rsn, cols.rsn, true)) : "") + (show.cost ? padTo(cost, cols.cost, true) : "");
+  const lines = [theme.dim(padTo("  Agent", nameW + 2) + " " + padTo("Status", stateW) + numbers("Time", "Tools", "↑ In", "↓ Out", "∴ Think", "Cost"))];
   for (const t of rows) {
     const time = t.status === "queued" ? "–" : formatElapsed((t.endedAt ?? now) - t.startedAt);
     const label = clip(t.label, nameW);
     const name = t.main ? theme.brand(label) : t.status === "running" ? theme.bold(label) : label;
     lines.push(
       `${icon(t, frame)} ${padTo(name, nameW)} ${padTo(clipVisible(stateText(t), stateW - 1), stateW)}` +
-        numbers(theme.dim(time), String(t.toolUses ?? 0), t.tokensIn ? formatTokens(t.tokensIn) : "–", t.tokens ? formatTokens(t.tokens) : "–", t.reasoning ? formatTokens(t.reasoning) : "–", tone.thinking),
+        numbers(theme.dim(time), String(t.toolUses ?? 0), t.tokensIn ? formatTokens(t.tokensIn) : "–", t.tokens ? formatTokens(t.tokens) : "–", t.reasoning ? formatTokens(t.reasoning) : "–", t.cost ? formatCost(t.cost) : "–", tone.thinking),
     );
   }
   if (rows.length > 1) {
-    const sum = (k: "tokensIn" | "tokens" | "reasoning" | "toolUses") => rows.reduce((n, t) => n + (t[k] ?? 0), 0);
-    lines.push(theme.dim(padTo("  Total", nameW + 2) + " " + padTo(`${rows.length} agents`, stateW) + numbers("", String(sum("toolUses")), formatTokens(sum("tokensIn")), formatTokens(sum("tokens")), formatTokens(sum("reasoning")))));
+    const sum = (k: "tokensIn" | "tokens" | "reasoning" | "toolUses" | "cost") => rows.reduce((n, t) => n + (t[k] ?? 0), 0);
+    lines.push(theme.dim(padTo("  Total", nameW + 2) + " " + padTo(`${rows.length} agents`, stateW) + numbers("", String(sum("toolUses")), formatTokens(sum("tokensIn")), formatTokens(sum("tokens")), formatTokens(sum("reasoning")), formatCost(sum("cost")))));
   }
   return lines;
 }
