@@ -80,6 +80,8 @@ test("grep finds content with file:line and honors glob filter", async () => {
 });
 
 test("web_fetch pulls a page and strips html", async () => {
+  // The wreq engine has its own suite (fetcher.test.mjs); this one covers the Node fallback.
+  process.env.UNJAILED_FETCH_ENGINE = "node";
   const server = http.createServer((_req, res) => { res.setHeader("content-type", "text/html"); res.end("<html><h1>Example Domain</h1></html>"); }).listen(0);
   await new Promise((resolve) => server.once("listening", resolve));
   let r;
@@ -93,6 +95,7 @@ test("web_fetch pulls a page and strips html", async () => {
   assert.equal(bad.ok, false);
   const ftp = await executeTool("web_fetch", { url: "ftp://x" }, process.cwd());
   assert.equal(ftp.ok, false);
+  delete process.env.UNJAILED_FETCH_ENGINE;
 });
 
 test("write_file creates files and parent dirs", async () => {

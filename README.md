@@ -330,7 +330,7 @@ The toolkit:
 | `launch_app` | Open an app or file with the OS (cmds/yolo) |
 | `move_file` | Move/rename without overwriting an existing destination (cmds/yolo) |
 | `delete_file` | Move to Trash; permanent deletion must be explicit (cmds/yolo) |
-| `web_fetch` | Fetch a page/API and read it as text (200 KB, 15 s timeout) |
+| `web_fetch` | Fetch a page or API as a real browser would ([wreq](#web-fetching)): readable text, full page, raw HTML or a link list; long pages are paged with `offset` (20 s timeout) |
 | `write_file` | Create or overwrite a file, up to 200 KB (cmds/yolo) |
 | `edit_file` | Exact string replace in a file, optionally every occurrence with `replace_all` (cmds/yolo) |
 | `run_command` | Shell with `cwd`, `timeout_ms` and `background` options (cmds/yolo) |
@@ -370,6 +370,39 @@ Documents/demo folder, run it, and show me the output.” The agent can create,
 edit, execute, inspect and fix the program, with approval for each change or
 command. Use `/auto` only when you want those actions to run without prompts.
 
+### Web fetching
+
+`web_fetch` goes through [wreq](https://github.com/0x676e67/wreq-python), a
+Rust HTTP client that reproduces real browsers' TLS handshake, HTTP/2 settings
+and header order. Sites that turn away scripted clients answer it the way they
+answer Chrome, so the agent can read pages that `curl` or a plain `fetch` can't.
+
+- **Browser:** Chrome (the newest profile wreq ships) for your OS by default.
+  The agent can pick `firefox`, `safari`, `edge`, `opera`, `safari_ios`,
+  `chrome_android`, `okhttp` or an exact profile such as `Firefox152`. When no
+  browser is given and a site answers with a bot challenge (Cloudflare,
+  DataDome, PerimeterX and similar), the fetch is retried as Firefox, then
+  Safari, and the result says what happened.
+- **Session:** one helper process serves every fetch, so connections and
+  cookies carry over between calls the way they would in a browser.
+  Redirects are followed (up to 10) and gzip, brotli, zstd and deflate are
+  decoded.
+- **Output:** `text` (default) is the page's main content as Markdown-style
+  text, keeping headings, lists, code blocks, tables and absolute links, without
+  menus, footers, scripts or cookie banners. `full` keeps the whole page, `html`
+  returns the source, and `links` lists every link once. JSON is
+  pretty-printed, declared charsets are decoded, and binary files are only
+  described. A long page comes back in parts, and calling again with `offset`
+  reads on without fetching it again. `HEAD` returns the status and response
+  headers.
+- **Setup:** wreq needs Python 3.11 or newer. On the first fetch the CLI makes a
+  private environment in `~/.unjailed/fetcher/` (with `uv` when it is
+  installed, which can also download a suitable Python, else `python3 -m venv`
+  and pip) and installs a pinned `wreq`. This takes a few seconds, once. With no
+  suitable Python, fetches use Node's `fetch` with browser headers and say so.
+  `UNJAILED_FETCH_PYTHON` points at a Python that already has wreq, and
+  `UNJAILED_FETCH_ENGINE=node` turns the engine off.
+
 ## Keys
 
 | Key | Action |
@@ -403,6 +436,8 @@ command. Use `/auto` only when you want those actions to run without prompts.
 | `UNJAILED_REASONING_TIMEOUT` | Seconds a stream may produce only reasoning, with no answer or tool call, before it stops (default 180) |
 | `UNJAILED_AUTOSAVE_SECONDS` | How often the open chat is autosaved, idle or mid-run, in seconds (default 10, minimum 1) |
 | `UNJAILED_NO_HISTORY` | Set to `1` (any value except `0`/`false`) to stop saving chats (disables `/resume`); `"saveSessions": false` in config.json does the same |
+| `UNJAILED_FETCH_PYTHON` | A Python that already has `wreq` installed, used by `web_fetch` instead of the private environment |
+| `UNJAILED_FETCH_ENGINE` | Set to `node` to fetch with Node's built-in `fetch` instead of wreq |
 | `UNJAILED_NO_FX` | Set to `1` or `true` to turn off the fun effects (wink, snow, sparkle) |
 | `NO_COLOR` | Turn off colors (also turns off the fun effects) |
 | `FORCE_COLOR` | Force a color level (`1`, `2` = 256 colors, `3` = truecolor), or `0` to turn colors off (that also turns off the fun effects) |
@@ -418,7 +453,7 @@ The file holds `apiKey`, `model`, an optional `baseUrl`, `saveSessions`, `fx` (s
 
 ## Privacy
 
-The CLI sends no telemetry and no analytics. Its only network traffic is the API calls you trigger, the npm registry when you run `/update`, and, with agent tools on, any URLs the agent fetches with `web_fetch` (a read-only tool that runs without an approval prompt). Saved chat files stay on your machine in `~/.unjailed/sessions/`; request context and any history retrieved by the agent are sent to your configured API to answer your requests. Delete local histories with `/sessions` → `d`, delete the folder, or turn saving off with `UNJAILED_NO_HISTORY=1`.
+The CLI sends no telemetry and no analytics. Its only network traffic is the API calls you trigger, the npm registry when you run `/update`, and, with agent tools on, any URLs the agent fetches with `web_fetch` (a read-only tool that runs without an approval prompt), and, on the first fetch, PyPI (or uv's Python downloads) to set up the fetch engine in `~/.unjailed/fetcher/`. Saved chat files stay on your machine in `~/.unjailed/sessions/`; request context and any history retrieved by the agent are sent to your configured API to answer your requests. Delete local histories with `/sessions` → `d`, delete the folder, or turn saving off with `UNJAILED_NO_HISTORY=1`.
 
 ## Development
 
@@ -457,7 +492,7 @@ MIT · [github.com/unjailedai/unjailedCLI](https://github.com/unjailedai/unjaile
 
 ### Unreleased
 
-`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish.
+`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish. `web_fetch` now goes through [wreq](#web-fetching) with real browser fingerprints, readable-text extraction, bot-challenge retries and paging.
 
 ### Coding reliability (0.12.4)
 

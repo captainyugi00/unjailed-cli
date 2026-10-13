@@ -24,6 +24,14 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+      # web_fetch's browser engine (wreq) runs on Python; its tests use this one.
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: "3.12"
+      - run: python -m pip install wreq==0.13.0
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm test
+        env:
+          UNJAILED_FETCH_PYTHON: ${{ steps.py.outputs.python-path }}

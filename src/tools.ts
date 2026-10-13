@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { processStatus, runLocalCommand, stopProcess } from "./processes.js";
+import { fetchPage, type FetchFormat, type FetchReply } from "./fetcher.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -27,8 +28,8 @@ export const MAX_BG_LOG = 100_000;
 export const MAX_LIST = 500;
 export const MAX_GLOB_RESULTS = 200;
 export const MAX_GREP_RESULTS = 100;
-export const WEB_FETCH_MAX_BYTES = 200_000;
-export const WEB_TIMEOUT_MS = 15_000;
+export const WEB_FETCH_MAX_BYTES = 5_000_000; // raw body read per fetch; the text is paged with offset
+export const WEB_TIMEOUT_MS = 20_000;
 
 export function toolDefinitions(mode: ToolsMode): ToolDef[] {
   if (mode === "off") return [];
@@ -132,10 +133,27 @@ export function toolDefinitions(mode: ToolsMode): ToolDef[] {
       type: "function",
       function: {
         name: "web_fetch",
-        description: "Fetch a URL and return the response body as text (HTML stripped to text when possible). For reading docs and APIs.",
+        description:
+          "Fetch a web page or API with a real browser's network fingerprint (TLS, HTTP/2 and headers of Chrome by default, via wreq), so sites that block scripts still answer. " +
+          "Follows redirects and keeps cookies across calls. HTML comes back as readable Markdown-style text with absolute links; JSON is pretty-printed. " +
+          "Long pages are split: call again with the offset it gives you to read on.",
         parameters: {
           type: "object",
-          properties: { url: { type: "string", description: "URL to fetch" } },
+          properties: {
+            url: { type: "string", description: "http(s) URL to fetch" },
+            format: {
+              type: "string",
+              enum: ["text", "full", "html", "links"],
+              description: "text (default): the page's main content as text. full: every part of the page, menus and footers included. html: the raw source. links: every link on the page, deduplicated.",
+            },
+            browser: {
+              type: "string",
+              description: "Browser to impersonate: chrome (default), firefox, safari, edge, opera, safari_ios, chrome_android, okhttp, or an exact profile like Firefox152. When unset, a site that answers with a bot challenge is retried as firefox, then safari.",
+            },
+            headers: { type: "object", additionalProperties: { type: "string" }, description: "Extra request headers (e.g. Referer, Accept-Language, Cookie)" },
+            method: { type: "string", enum: ["GET", "HEAD"], description: "HEAD returns only status and response headers" },
+            offset: { type: "number", description: "Character offset to continue a long page from" },
+          },
           required: ["url"],
         },
       },
@@ -371,44 +389,85 @@ function* grepWalk(root: string): Generator<string> {
 
 /* ───────────── web ───────────── */
 
-async function webFetch(url: string): Promise<ToolResult> {
+/** Fetched bodies kept briefly so `offset` can page through a long page
+ *  without fetching it again. */
+const fetchCache = new Map<string, { at: number; reply: FetchReply }>();
+const FETCH_CACHE_MS = 10 * 60_000;
+const FETCH_HEADER_BUDGET = 1_500;
+
+function formatBytes(n: number): string {
+  return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function webFetch(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+  const url = String(args.url ?? "");
   let parsed: URL;
   try { parsed = new URL(url); } catch { return { ok: false, output: `Invalid URL: ${url}` }; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return { ok: false, output: "Only http and https URLs are supported." };
   }
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), WEB_TIMEOUT_MS);
-  try {
-    const res = await fetch(parsed, {
-      signal: ctrl.signal,
-      redirect: "follow",
-      headers: { "user-agent": "unjailed-cli/0.6 (terminal agent)" },
-    });
-    const type = res.headers.get("content-type") ?? "";
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.byteLength > WEB_FETCH_MAX_BYTES * 2) return { ok: false, output: `Response too large (${buf.byteLength} bytes).` };
-    let text = buf.toString("utf8");
-    if (type.includes("html")) {
-      // crude but effective html → text
-      text = text
-        .replace(/<script[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style[\s\S]*?<\/style>/gi, " ")
-        .replace(/<\/(p|div|li|h[1-6]|tr|section|article)>/gi, "\n")
-        .replace(/<br\s*\/?>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-        .replace(/[ \t]+/g, " ")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
+  const method = String(args.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return { ok: false, output: "method must be GET or HEAD." };
+  const format = String(args.format ?? "text") as FetchFormat;
+  if (!["text", "full", "html", "links"].includes(format)) return { ok: false, output: "format must be text, full, html or links." };
+  const browser = args.browser === undefined || args.browser === "" ? undefined : String(args.browser);
+  const headers: Record<string, string> = {};
+  if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
+    for (const [k, v] of Object.entries(args.headers as Record<string, unknown>)) {
+      if (/[\r\n]/.test(k + String(v))) return { ok: false, output: `Header ${k} contains a line break.` };
+      headers[k] = String(v);
     }
-    return { ok: res.ok, output: `HTTP ${res.status} ${res.statusText}\n${clip(text, WEB_FETCH_MAX_BYTES)}` };
-  } catch (e) {
-    const msg = (e as Error).name === "AbortError" ? `Timed out after ${WEB_TIMEOUT_MS / 1000}s` : (e as Error).message;
-    return { ok: false, output: `Fetch failed: ${msg}` };
-  } finally {
-    clearTimeout(t);
   }
+  const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
+
+  const key = JSON.stringify([parsed.href, method, format, browser, headers]);
+  const hit = fetchCache.get(key);
+  let reply: FetchReply;
+  if (offset > 0 && hit && Date.now() - hit.at < FETCH_CACHE_MS) reply = hit.reply;
+  else {
+    reply = await fetchPage({ url: parsed.href, method: method as "GET" | "HEAD", format, browser, headers, timeoutSec: WEB_TIMEOUT_MS / 1000, maxBytes: WEB_FETCH_MAX_BYTES }, signal);
+    if (reply.status !== undefined) {
+      fetchCache.set(key, { at: Date.now(), reply });
+      for (const [k, v] of fetchCache) if (fetchCache.size > 16 || Date.now() - v.at > FETCH_CACHE_MS) fetchCache.delete(k);
+    }
+  }
+
+  const lines: string[] = [];
+  if (reply.status === undefined) {
+    lines.push(`Fetch failed: ${reply.error ?? "unknown error"}`);
+    if (reply.setup) lines.push(`Engine: ${reply.setup}`);
+    return { ok: false, output: lines.join("\n") };
+  }
+  const via = reply.engine === "wreq" ? reply.browser ?? "wreq" : "node fetch";
+  const proto = reply.version ? reply.version.replace("HTTP_", "HTTP/").replace("_", ".") : "";
+  lines.push(`HTTP ${reply.status} ${reply.reason ?? ""}`.trimEnd() + ` · ${[reply.content_type || "no content-type", formatBytes(reply.bytes ?? 0) + (reply.truncated ? " (cut off)" : ""), proto, via].filter(Boolean).join(" · ")}`);
+  if (reply.url && (reply.url !== parsed.href || reply.redirects)) lines.push(`URL: ${reply.url}${reply.redirects ? ` (after ${reply.redirects} redirect${reply.redirects === 1 ? "" : "s"})` : ""}`);
+  if (reply.title) lines.push(`Title: ${reply.title}`);
+  if (reply.note) lines.push(`Note: ${reply.note}`);
+  if (reply.setup) lines.push(`Engine: ${reply.setup}`);
+  if (method === "HEAD" && reply.headers) {
+    lines.push("", ...Object.entries(reply.headers).map(([k, v]) => `${k}: ${v}`));
+    return { ok: reply.ok, output: clip(lines.join("\n"), MAX_TOOL_OUTPUT) };
+  }
+  if (reply.kind === "binary") {
+    lines.push("", `Binary content (${reply.content_type || "unknown type"}, ${formatBytes(reply.bytes ?? 0)}) — not shown. Download it with run_command if you need the file.`);
+    return { ok: reply.ok, output: lines.join("\n") };
+  }
+  const body = reply.body ?? "";
+  const head = lines.join("\n");
+  const room = Math.max(1_000, MAX_TOOL_OUTPUT - Math.min(head.length, FETCH_HEADER_BUDGET) - 200);
+  if (offset >= body.length && body.length > 0) {
+    return { ok: false, output: `${head}\n\noffset ${offset} is past the end (${body.length} chars).` };
+  }
+  let part = body.slice(offset, offset + room);
+  // End on a line break when one is close, so the next page starts cleanly.
+  const cut = offset + part.length < body.length ? part.lastIndexOf("\n") : -1;
+  if (cut > room * 0.8) part = part.slice(0, cut + 1);
+  const end = offset + part.length;
+  const more = end < body.length
+    ? `\n…(chars ${offset}–${end} of ${body.length}; call web_fetch again with offset: ${end} for more)`
+    : offset ? `\n(chars ${offset}–${end} of ${body.length}; end of page)` : "";
+  return { ok: reply.ok, output: `${head.slice(0, FETCH_HEADER_BUDGET)}\n\n${part || "(empty body)"}${more}` };
 }
 
 async function launchTarget(target: string, app = false): Promise<ToolResult> {
@@ -644,9 +703,8 @@ export async function executeTool(
     }
 
     if (name === "web_fetch") {
-      const url = String(args.url ?? "");
-      if (!url) return { ok: false, output: "url is required" };
-      return await webFetch(url);
+      if (!args.url) return { ok: false, output: "url is required" };
+      return await webFetch(args, options.signal);
     }
 
     if (name === "write_file") {

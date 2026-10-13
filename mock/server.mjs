@@ -34,6 +34,7 @@
 //   "mock:flaky"    every agent's first request reports "The model stream was interrupted"
 //   "mock:batch"    three tool calls in one reply (type a message while the first runs)
 //   "mock:think"    the agent and a subagent stream visible reasoning (try /verbose)
+//   "mock:fetch"    web_fetch of a page and a HEAD request in parallel (the URL after "mock:fetch", default example.com)
 //   "mock:pace"     self-paced loop: schedule_next 60s on the first run, stop:true afterwards
 
 import http from "node:http";
@@ -190,6 +191,11 @@ function agentScenario(body) {
     if (round === 1) return { text: "Found it: `add` subtracts. Fixing:", toolCalls: [call("edit_file", { path: "calc.py", old_text: "    return a-b", new_text: "    return a+b" })] };
     if (round === 2) return { text: "Verifying.", toolCalls: [call("run_command", { command: "python3 -c 'import calc; print(calc.add(2,3))'" })] };
     return { text: "Fixed `calc.py:2` — `add(2, 3)` now prints **5**.\n\n| File | Change |\n|---|---|\n| calc.py | `a-b` → `a+b` |" };
+  }
+  if (/mock:fetch/.test(firstUser)) {
+    const url = /mock:fetch\s+(\S+)/.exec(firstUser)?.[1] ?? "https://example.com";
+    if (round === 0) return { text: "Fetching it.", toolCalls: [call("web_fetch", { url }), call("web_fetch", { url, method: "HEAD", browser: "firefox" })] };
+    return { text: `Fetched:\n\n${toolsSince.map((t) => "- " + t.content.split("\n")[0]).join("\n")}` };
   }
   if (/mock:think/.test(firstUser)) {
     if (round === 0) return { reasoning: "The user wants a look at this folder. First I should list the files.\n\nThen I can delegate a closer read to a subagent.", text: "Looking around.", toolCalls: [call("list_dir", { path: "." }), call("agent", { description: "Deep read", prompt: "mock-think read calc.py closely" })] };

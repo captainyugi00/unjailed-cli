@@ -68,7 +68,10 @@ function subject(name: string, a: Args): string {
       return str(a.pattern) + (a.path ? ` in ${str(a.path)}` : "");
     case "move_file":
       return `${str(a.from ?? a.source)} → ${str(a.to ?? a.destination)}`;
-    case "web_fetch":
+    case "web_fetch": {
+      const extra = [a.method === "HEAD" ? "HEAD" : "", a.format && a.format !== "text" ? str(a.format) : "", a.browser ? `as ${str(a.browser)}` : "", a.offset ? `from ${str(a.offset)}` : ""].filter(Boolean);
+      return str(a.url) + (extra.length ? ` · ${extra.join(" · ")}` : "");
+    }
     case "open_url":
       return str(a.url);
     case "launch_app":
