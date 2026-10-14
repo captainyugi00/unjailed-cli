@@ -89,7 +89,7 @@ test("completed transcript output is printed once and absent from later Ink redr
   writeConfig({ tools: "off", fx: false, saveSessions: false });
   const originalFetch = globalThis.fetch;
   let turns = 0;
-  globalThis.fetch = async (url) => String(url).endsWith("/models") ? Response.json({ data: [{ id: "kimi-k3" }] }) : Response.json({ choices: [{ message: { content: `completed-${turns++}-marker ` + "old transcript ".repeat(100) } }] });
+  globalThis.fetch = async (url) => String(url).endsWith("/models.json") ? Response.json({ models: [] }) : String(url).endsWith("/models") ? Response.json({ data: [{ id: "kimi-k3" }] }) : Response.json({ choices: [{ message: { content: `completed-${turns++}-marker ` + "old transcript ".repeat(100) } }] });
   const ui = render(React.createElement(App));
   try {
     await sleep(100);

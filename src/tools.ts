@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { processStatus, runLocalCommand, stopProcess } from "./processes.js";
+import { fetchPage, type FetchFormat, type FetchReply } from "./fetcher.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ export interface ToolDef {
 export type ToolsMode = "off" | "read" | "cmds" | "yolo";
 
 export const MAX_READ_BYTES = 200_000;      // 200 KB per file read
+export const MAX_EDIT_FILE_BYTES = 5_000_000; // targeted edits/range reads; full writes retain their smaller limit
 export const MAX_WRITE_BYTES = 200_000;     // 200 KB per file write
 export const MAX_RUN_OUTPUT = 30_000;       // chars of stdout/stderr kept
 export const MAX_TOOL_OUTPUT = 28_000;      // HARD cap: upstream rejects strings > 32k — never send more
@@ -26,8 +28,8 @@ export const MAX_BG_LOG = 100_000;
 export const MAX_LIST = 500;
 export const MAX_GLOB_RESULTS = 200;
 export const MAX_GREP_RESULTS = 100;
-export const WEB_FETCH_MAX_BYTES = 200_000;
-export const WEB_TIMEOUT_MS = 15_000;
+export const WEB_FETCH_MAX_BYTES = 5_000_000; // raw body read per fetch; the text is paged with offset
+export const WEB_TIMEOUT_MS = 20_000;
 
 export function toolDefinitions(mode: ToolsMode): ToolDef[] {
   if (mode === "off") return [];
@@ -36,10 +38,10 @@ export function toolDefinitions(mode: ToolsMode): ToolDef[] {
       type: "function",
       function: {
         name: "read_file",
-        description: "Read a UTF-8 text file from the user's machine. Paths are relative to the current directory unless absolute.",
+        description: "Read a UTF-8 text file. Use start_line and max_lines to inspect later sections or large files. Paths are relative to the current directory unless absolute.",
         parameters: {
           type: "object",
-          properties: { path: { type: "string", description: "File path to read" } },
+          properties: { path: { type: "string", description: "File path to read" }, start_line: { type: "integer", minimum: 1, description: "First line, 1-based" }, max_lines: { type: "integer", minimum: 1, maximum: 500, description: "Number of lines (default 200 for ranged reads)" } },
           required: ["path"],
         },
       },
@@ -131,10 +133,27 @@ export function toolDefinitions(mode: ToolsMode): ToolDef[] {
       type: "function",
       function: {
         name: "web_fetch",
-        description: "Fetch a URL and return the response body as text (HTML stripped to text when possible). For reading docs and APIs.",
+        description:
+          "Fetch a web page or API with a real browser's network fingerprint (TLS, HTTP/2 and headers of Chrome by default, via wreq), so sites that block scripts still answer. " +
+          "Follows redirects and keeps cookies across calls. HTML comes back as readable Markdown-style text with absolute links; JSON is pretty-printed. " +
+          "Long pages are split: call again with the offset it gives you to read on.",
         parameters: {
           type: "object",
-          properties: { url: { type: "string", description: "URL to fetch" } },
+          properties: {
+            url: { type: "string", description: "http(s) URL to fetch" },
+            format: {
+              type: "string",
+              enum: ["text", "full", "html", "links"],
+              description: "text (default): the page's main content as text. full: every part of the page, menus and footers included. html: the raw source. links: every link on the page, deduplicated.",
+            },
+            browser: {
+              type: "string",
+              description: "Browser to impersonate: chrome (default), firefox, safari, edge, opera, safari_ios, chrome_android, okhttp, or an exact profile like Firefox152. When unset, a site that answers with a bot challenge is retried as firefox, then safari.",
+            },
+            headers: { type: "object", additionalProperties: { type: "string" }, description: "Extra request headers (e.g. Referer, Accept-Language, Cookie)" },
+            method: { type: "string", enum: ["GET", "HEAD"], description: "HEAD returns only status and response headers" },
+            offset: { type: "number", description: "Character offset to continue a long page from" },
+          },
           required: ["url"],
         },
       },
@@ -274,8 +293,11 @@ export function resolveToolPath(p: string, cwd: string, platform: NodeJS.Platfor
   const firstSeg = parts[0] ?? "";
   const names: Record<string, string> = { desktop: "Desktop", documents: "Documents", downloads: "Downloads", pictures: "Pictures", videos: "Videos", music: "Music" };
   const folder = names[firstSeg.toLowerCase()];
-  if (folder) return paths.resolve(home, folder, ...parts.slice(1));
-  return paths.resolve(cwd, p);
+  const local = paths.resolve(cwd, p);
+  // "Desktop/x" means the user's Desktop only when the project has no such
+  // folder: a repo's own desktop/ or documents/ must never be redirected.
+  if (folder && !paths.isAbsolute(p) && !fs.existsSync(paths.resolve(cwd, firstSeg))) return paths.resolve(home, folder, ...parts.slice(1));
+  return local;
 }
 
 function clip(s: string, max = MAX_RUN_OUTPUT): string {
@@ -316,7 +338,8 @@ function globToRe(glob: string): RegExp {
         if (glob[j] === "}") { depth--; if (depth === 0) break; }
         body += glob[j]; j++;
       }
-      re += `(?:${body.split(",").map(escapeRe).join("|")})`;
+      // Each alternative is a glob of its own: {*.ts,*.tsx} works.
+      re += `(?:${body.split(",").map((alt) => globToRe(alt).source.slice(1, -1)).join("|")})`;
       i = j; i++;
       continue;
     } else re += escapeRe(c);
@@ -366,44 +389,85 @@ function* grepWalk(root: string): Generator<string> {
 
 /* ───────────── web ───────────── */
 
-async function webFetch(url: string): Promise<ToolResult> {
+/** Fetched bodies kept briefly so `offset` can page through a long page
+ *  without fetching it again. */
+const fetchCache = new Map<string, { at: number; reply: FetchReply }>();
+const FETCH_CACHE_MS = 10 * 60_000;
+const FETCH_HEADER_BUDGET = 1_500;
+
+function formatBytes(n: number): string {
+  return n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function webFetch(args: Record<string, unknown>, signal?: AbortSignal): Promise<ToolResult> {
+  const url = String(args.url ?? "");
   let parsed: URL;
   try { parsed = new URL(url); } catch { return { ok: false, output: `Invalid URL: ${url}` }; }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return { ok: false, output: "Only http and https URLs are supported." };
   }
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), WEB_TIMEOUT_MS);
-  try {
-    const res = await fetch(parsed, {
-      signal: ctrl.signal,
-      redirect: "follow",
-      headers: { "user-agent": "unjailed-cli/0.6 (terminal agent)" },
-    });
-    const type = res.headers.get("content-type") ?? "";
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.byteLength > WEB_FETCH_MAX_BYTES * 2) return { ok: false, output: `Response too large (${buf.byteLength} bytes).` };
-    let text = buf.toString("utf8");
-    if (type.includes("html")) {
-      // crude but effective html → text
-      text = text
-        .replace(/<script[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style[\s\S]*?<\/style>/gi, " ")
-        .replace(/<\/(p|div|li|h[1-6]|tr|section|article)>/gi, "\n")
-        .replace(/<br\s*\/?>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-        .replace(/[ \t]+/g, " ")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
+  const method = String(args.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return { ok: false, output: "method must be GET or HEAD." };
+  const format = String(args.format ?? "text") as FetchFormat;
+  if (!["text", "full", "html", "links"].includes(format)) return { ok: false, output: "format must be text, full, html or links." };
+  const browser = args.browser === undefined || args.browser === "" ? undefined : String(args.browser);
+  const headers: Record<string, string> = {};
+  if (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) {
+    for (const [k, v] of Object.entries(args.headers as Record<string, unknown>)) {
+      if (/[\r\n]/.test(k + String(v))) return { ok: false, output: `Header ${k} contains a line break.` };
+      headers[k] = String(v);
     }
-    return { ok: res.ok, output: `HTTP ${res.status} ${res.statusText}\n${clip(text, WEB_FETCH_MAX_BYTES)}` };
-  } catch (e) {
-    const msg = (e as Error).name === "AbortError" ? `Timed out after ${WEB_TIMEOUT_MS / 1000}s` : (e as Error).message;
-    return { ok: false, output: `Fetch failed: ${msg}` };
-  } finally {
-    clearTimeout(t);
   }
+  const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
+
+  const key = JSON.stringify([parsed.href, method, format, browser, headers]);
+  const hit = fetchCache.get(key);
+  let reply: FetchReply;
+  if (offset > 0 && hit && Date.now() - hit.at < FETCH_CACHE_MS) reply = hit.reply;
+  else {
+    reply = await fetchPage({ url: parsed.href, method: method as "GET" | "HEAD", format, browser, headers, timeoutSec: WEB_TIMEOUT_MS / 1000, maxBytes: WEB_FETCH_MAX_BYTES }, signal);
+    if (reply.status !== undefined) {
+      fetchCache.set(key, { at: Date.now(), reply });
+      for (const [k, v] of fetchCache) if (fetchCache.size > 16 || Date.now() - v.at > FETCH_CACHE_MS) fetchCache.delete(k);
+    }
+  }
+
+  const lines: string[] = [];
+  if (reply.status === undefined) {
+    lines.push(`Fetch failed: ${reply.error ?? "unknown error"}`);
+    if (reply.setup) lines.push(`Engine: ${reply.setup}`);
+    return { ok: false, output: lines.join("\n") };
+  }
+  const via = reply.engine === "wreq" ? reply.browser ?? "wreq" : "node fetch";
+  const proto = reply.version ? reply.version.replace("HTTP_", "HTTP/").replace("_", ".") : "";
+  lines.push(`HTTP ${reply.status} ${reply.reason ?? ""}`.trimEnd() + ` · ${[reply.content_type || "no content-type", formatBytes(reply.bytes ?? 0) + (reply.truncated ? " (cut off)" : ""), proto, via].filter(Boolean).join(" · ")}`);
+  if (reply.url && (reply.url !== parsed.href || reply.redirects)) lines.push(`URL: ${reply.url}${reply.redirects ? ` (after ${reply.redirects} redirect${reply.redirects === 1 ? "" : "s"})` : ""}`);
+  if (reply.title) lines.push(`Title: ${reply.title}`);
+  if (reply.note) lines.push(`Note: ${reply.note}`);
+  if (reply.setup) lines.push(`Engine: ${reply.setup}`);
+  if (method === "HEAD" && reply.headers) {
+    lines.push("", ...Object.entries(reply.headers).map(([k, v]) => `${k}: ${v}`));
+    return { ok: reply.ok, output: clip(lines.join("\n"), MAX_TOOL_OUTPUT) };
+  }
+  if (reply.kind === "binary") {
+    lines.push("", `Binary content (${reply.content_type || "unknown type"}, ${formatBytes(reply.bytes ?? 0)}) — not shown. Download it with run_command if you need the file.`);
+    return { ok: reply.ok, output: lines.join("\n") };
+  }
+  const body = reply.body ?? "";
+  const head = lines.join("\n");
+  const room = Math.max(1_000, MAX_TOOL_OUTPUT - Math.min(head.length, FETCH_HEADER_BUDGET) - 200);
+  if (offset >= body.length && body.length > 0) {
+    return { ok: false, output: `${head}\n\noffset ${offset} is past the end (${body.length} chars).` };
+  }
+  let part = body.slice(offset, offset + room);
+  // End on a line break when one is close, so the next page starts cleanly.
+  const cut = offset + part.length < body.length ? part.lastIndexOf("\n") : -1;
+  if (cut > room * 0.8) part = part.slice(0, cut + 1);
+  const end = offset + part.length;
+  const more = end < body.length
+    ? `\n…(chars ${offset}–${end} of ${body.length}; call web_fetch again with offset: ${end} for more)`
+    : offset ? `\n(chars ${offset}–${end} of ${body.length}; end of page)` : "";
+  return { ok: reply.ok, output: `${head.slice(0, FETCH_HEADER_BUDGET)}\n\n${part || "(empty body)"}${more}` };
 }
 
 async function launchTarget(target: string, app = false): Promise<ToolResult> {
@@ -451,7 +515,10 @@ export async function executeTool(
     if (options.signal?.aborted) return { ok: false, output: "Tool cancelled before execution." };
     const readOnly = ["read_file", "list_dir", "glob", "grep", "web_fetch", "process_status"].includes(name) ||
       (name === "clipboard" && (args.action === undefined || args.action === "read"));
-    if (!readOnly && mode !== "yolo" && !options.autoApprove) {
+    // Carriage returns, escape sequences and other control characters can make
+    // an action look different from what runs: always ask, even in yolo/auto.
+    const disguised = !readOnly && Object.values(args).some((v) => typeof v === "string" && /[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(v.replace(/\t/g, "")) && !(name === "write_file" || name === "edit_file"));
+    if (!readOnly && ((mode !== "yolo" && !options.autoApprove) || disguised)) {
       const action = `${name} ${JSON.stringify(args)}`;
       if (!approve || !(await approve(action))) return { ok: false, output: "The user declined or approval is unavailable. Nothing executed." };
     }
@@ -464,9 +531,26 @@ export async function executeTool(
       const file = resolveToolPath(p, cwd);
       const stat = fs.statSync(file);
       if (stat.isDirectory()) return { ok: false, output: `${p} is a directory (use list_dir)` };
-      if (stat.size > MAX_READ_BYTES) return { ok: false, output: `${p} is ${stat.size} bytes — too large (limit ${MAX_READ_BYTES})` };
+      const ranged = args.start_line !== undefined || args.max_lines !== undefined;
+      const start = args.start_line ?? 1;
+      const count = args.max_lines ?? 200;
+      if (!Number.isInteger(start) || Number(start) < 1 || !Number.isInteger(count) || Number(count) < 1 || Number(count) > 500) return { ok: false, output: "start_line must be a positive integer; max_lines must be between 1 and 500." };
+      if (stat.size > MAX_EDIT_FILE_BYTES) return { ok: false, output: `${p} exceeds the ${MAX_EDIT_FILE_BYTES}-byte range-read limit.` };
+      if (stat.size > MAX_READ_BYTES && !ranged) return { ok: false, output: `${p} is ${stat.size} bytes. Read a section with start_line and max_lines.` };
       const data = fs.readFileSync(file, "utf8");
-      return { ok: true, output: clip(data) };
+      if (!ranged && data.length <= MAX_TOOL_OUTPUT) return { ok: true, output: data };
+      const lines = data.split("\n");
+      if (Number(start) > lines.length) return { ok: false, output: `start_line exceeds ${lines.length} lines.` };
+      let end = Number(start) - 1;
+      let text = "";
+      while (end < lines.length && end < Number(start) - 1 + Number(count)) {
+        const line = lines[end]!;
+        if (text.length + line.length + 1 > MAX_TOOL_OUTPUT - 200) break;
+        text += (text ? "\n" : "") + line;
+        end++;
+      }
+      if (end === Number(start) - 1) return { ok: false, output: "This single line exceeds the tool output limit. Search for a smaller anchor with grep." };
+      return { ok: true, output: `[${p}: lines ${start}-${end} of ${lines.length}${end < lines.length ? `; next start_line=${end + 1}` : ""}]\n${text}` };
     }
 
     if (name === "list_dir") {
@@ -500,6 +584,7 @@ export async function executeTool(
       try { re = new RegExp(pattern); } catch (e) { return { ok: false, output: `Invalid regex: ${(e as Error).message}` }; }
       const onlyGlob = args.glob ? globToRe(String(args.glob)) : null;
       const results: string[] = [];
+      const skipped: string[] = [];
       const stat = fs.statSync(root);
       const files: string[] = stat.isFile() ? [root] : [...grepWalk(root)];
       for (const file of files) {
@@ -511,13 +596,17 @@ export async function executeTool(
         }
         let buf: Buffer;
         try { buf = fs.readFileSync(file); } catch { continue; }
-        if (buf.byteLength > MAX_READ_BYTES || looksBinary(buf)) continue;
+        if (looksBinary(buf)) continue;
+        // Large text files are searched too (up to the edit limit), and anything
+        // skipped is reported: "(no matches)" must mean nothing matched.
+        if (buf.byteLength > MAX_EDIT_FILE_BYTES) { skipped.push(path.relative(cwd, file)); continue; }
         const lines = buf.toString("utf8").split("\n");
         for (let n = 0; n < lines.length && results.length < MAX_GREP_RESULTS; n++) {
           if (re.test(lines[n]!)) results.push(`${path.relative(cwd, file)}:${n + 1}: ${lines[n]!.trim().slice(0, 200)}`);
         }
       }
-      return { ok: true, output: results.length ? results.join("\n") : "(no matches)" };
+      const note = skipped.length ? `\n(skipped ${skipped.length} file${skipped.length === 1 ? "" : "s"} over ${MAX_EDIT_FILE_BYTES / 1_000_000} MB: ${skipped.slice(0, 5).join(", ")}${skipped.length > 5 ? ", …" : ""})` : "";
+      return { ok: true, output: (results.length ? results.join("\n") : "(no matches)") + note };
     }
 
     if (name === "clipboard") {
@@ -614,9 +703,8 @@ export async function executeTool(
     }
 
     if (name === "web_fetch") {
-      const url = String(args.url ?? "");
-      if (!url) return { ok: false, output: "url is required" };
-      return await webFetch(url);
+      if (!args.url) return { ok: false, output: "url is required" };
+      return await webFetch(args, options.signal);
     }
 
     if (name === "write_file") {
@@ -637,12 +725,28 @@ export async function executeTool(
       const replaceAll = args.replace_all === true;
       if (!p || !oldText) return { ok: false, output: "path and old_text are required" };
       const file = resolveToolPath(p, cwd);
-      const src = fs.readFileSync(file, "utf8");
-      const count = src.split(oldText).length - 1;
-      if (count === 0) return { ok: false, output: `old_text not found in ${p} — nothing written.` };
+      if (fs.statSync(file).size > MAX_EDIT_FILE_BYTES) return { ok: false, output: `File exceeds ${MAX_EDIT_FILE_BYTES} bytes; nothing written.` };
+      if (Buffer.byteLength(newText) > MAX_WRITE_BYTES) return { ok: false, output: "Replacement exceeds the write limit; nothing written." };
+      const raw = fs.readFileSync(file);
+      const src = raw.toString("utf8");
+      // Re-encoding must give the same bytes; otherwise the file isn't UTF-8
+      // and writing it back would replace every non-UTF-8 byte with "�".
+      if (!Buffer.from(src, "utf8").equals(raw)) return { ok: false, output: `${p} is not UTF-8 text (e.g. Latin-1 or UTF-16); editing it here would corrupt it. Nothing written. Use run_command with a tool that keeps its encoding.` };
+      // Only tolerate LF/CRLF differences, never guessed whitespace or fuzzy anchors.
+      const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      let pattern = new RegExp(escape(oldText), "g");
+      let count = [...src.matchAll(pattern)].length;
+      if (!count && oldText.includes("\n")) {
+        pattern = new RegExp(oldText.replace(/\r\n/g, "\n").split("\n").map(escape).join("\r?\n"), "g");
+        count = [...src.matchAll(pattern)].length;
+      }
+      if (count === 0) return { ok: false, output: `old_text not found in ${p} — nothing written. Read the current lines before retrying.` };
       if (count > 1 && !replaceAll) return { ok: false, output: `old_text found ${count} times in ${p} — pass replace_all or make it more specific.` };
-      const next = replaceAll ? src.split(oldText).join(newText) : src.replace(oldText, newText);
-      if (Buffer.byteLength(next) > MAX_WRITE_BYTES) return { ok: false, output: `Edited content exceeds ${MAX_WRITE_BYTES} bytes; nothing written.` };
+      const crlf = src.includes("\r\n") && !/(?<!\r)\n/.test(src);
+      const replacement = crlf ? newText.replace(/\r?\n/g, "\r\n") : newText;
+      // Callback keeps $&, $', $` and $$ literal in source code.
+      const next = src.replace(pattern, () => replacement);
+      if (Buffer.byteLength(next) > MAX_EDIT_FILE_BYTES) return { ok: false, output: `Edited content exceeds ${MAX_EDIT_FILE_BYTES} bytes; nothing written.` };
       fs.writeFileSync(file, next);
       return { ok: true, output: count > 1 && !replaceAll ? `Replaced 1 of ${count} occurrences in ${p}` : `Replaced ${replaceAll ? count : 1} occurrence${replaceAll && count > 1 ? "s" : ""} in ${p}` };
     }

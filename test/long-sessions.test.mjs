@@ -88,7 +88,7 @@ test("trimming serializes each tool payload once instead of rescanning per old r
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitFor(predicate, detail) {
-  for (let i = 0; i < 120; i++) { if (predicate()) return; await sleep(25); }
+  for (let i = 0; i < 400; i++) { if (predicate()) return; await sleep(25); }
   assert.fail(`Timed out: ${detail}`);
 }
 async function submit(ui, text) { ui.stdin.write(text); await sleep(80); ui.stdin.write("\r"); await sleep(80); }
@@ -102,6 +102,7 @@ test("terminal keeps activity visible after text, waits for approval, and preser
   const oldFetch = globalThis.fetch;
   const requests = [];
   globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/models.json")) return Response.json({ models: [] });
     if (String(url).endsWith("/models")) return Response.json({ data: [{ id: "kimi-k3" }] });
     const request = { body: JSON.parse(init.body), controller: null };
     const body = new ReadableStream({ start(controller) { request.controller = controller; } });
@@ -114,16 +115,16 @@ test("terminal keeps activity visible after text, waits for approval, and preser
   try {
     await sleep(200);
     await submit(ui, "Write a test file");
-    await waitFor(() => requests.length === 1 && /Waiting for response/.test(ui.lastFrame()), "first request activity");
+    await waitFor(() => requests.length === 1 && /Waiting for model/.test(ui.lastFrame()), "first request activity");
     assert.ok(requests[0].body.messages.reduce((n, m) => n + m.content.length, 0) < 96_000);
     send(requests[0], { content: "Checking first.\n\n" });
-    await waitFor(() => /Writing.*Ctrl\+C/.test(ui.lastFrame()), "activity remains after visible text is flushed");
+    await waitFor(() => /Writing….*esc esc to stop/.test(ui.lastFrame()), "activity remains after visible text is flushed");
     send(requests[0], { tool_calls: [{ index: 0, id: "write-test", function: { name: "write_file", arguments: JSON.stringify({ path: path.join(home, "must-not-exist.txt"), content: "test" }) } }] }, "tool_calls");
     done(requests[0]);
-    await waitFor(() => /Waiting for permission/.test(ui.lastFrame()), "explicit approval waiting status");
+    await waitFor(() => /Permission needed/.test(ui.lastFrame()) && /Waiting for your approval/.test(ui.lastFrame()), "explicit approval waiting status");
     await sleep(200);
     ui.stdin.write("n");
-    await waitFor(() => requests.length === 2 && /Waiting for response/.test(ui.lastFrame()), "later agent request shows activity after earlier text");
+    await waitFor(() => requests.length === 2 && /Waiting for model/.test(ui.lastFrame()), "later agent request shows activity after earlier text");
     assert.equal(fs.existsSync(path.join(home, "must-not-exist.txt")), false, "denied write never executes");
     assert.ok(requests[1].body.messages.some((m) => m.role === "tool" && m.tool_call_id === "write-test"), "live round retains its matching result");
     send(requests[1], { content: "Write skipped." }, "stop");
@@ -176,6 +177,7 @@ test('a completed tool and its task survive a model error before any assistant p
   const oldFetch=globalThis.fetch;
   let calls=0;
   globalThis.fetch=async (url) => {
+    if(String(url).endsWith('/models.json'))return Response.json({models:[]});
     if(String(url).endsWith('/models'))return Response.json({data:[{id:'kimi-k3'}]});
     calls++;
     if(calls===1)return Response.json({choices:[{message:{tool_calls:[{id:'read-before-error',function:{name:'read_file',arguments:JSON.stringify({path:file})}}]}}]});

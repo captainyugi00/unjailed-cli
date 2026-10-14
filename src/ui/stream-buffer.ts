@@ -76,6 +76,11 @@ export class StreamDisplayBuffer {
     return { text, hiddenCharacters: this.pendingCharacters - text.length };
   }
 
+  /** Everything not yet drained, without consuming it (for saving a turn mid-paragraph). */
+  peek(): string {
+    return this.parts.slice(this.head).join("");
+  }
+
   finish(): string {
     const result = this.parts.slice(this.head).join("");
     this.parts = [];
@@ -114,6 +119,9 @@ export function streamingRowBudget(rows: number, columns: number, editor: string
   const inputRows = Math.min(4, sample.split("\n").reduce((total, line) => total + Math.max(1, Math.ceil(line.length / width)), 0));
   return Math.max(1, rows - 8 - inputRows - (hasReasoning ? 2 : 0) - (planApproval ? 5 : 0));
 }
+/** Columns a tab takes in the input box (it is drawn as spaces). */
+export const TAB_CELLS = 4;
+
 /** Bound draft rendering around the cursor without altering the edit buffer.
  * Only a small local slice is measured/wrapped, even for a megabyte paste. */
 export function editorViewport(value: string, cursor: number, columns: number, maxRows = 4): { lines: Array<{ text: string; cursor: number | null }>; hidden: boolean } {
@@ -130,7 +138,7 @@ export function editorViewport(value: string, cursor: number, columns: number, m
       rows.push({ text, start: rowStart, end: offset });
       text = ""; cells = 0; rowStart = offset + 1;
     } else {
-      const size = stringWidth(ch);
+      const size = ch === "\t" ? TAB_CELLS : stringWidth(ch);
       if (cells + size > width) {
         rows.push({ text, start: rowStart, end: offset });
         text = ""; cells = 0; rowStart = offset;
