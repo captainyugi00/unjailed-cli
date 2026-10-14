@@ -1,13 +1,11 @@
-import React, { useRef } from "react";
-import { Box, Text, useInput, type Key } from "ink";
+import React, { useEffect, useRef } from "react";
+import { Box, Text, useInput, useStdin, type Key } from "ink";
 import { theme } from "../theme.js";
 import stringWidth from "string-width";
 import { editorViewport, TAB_CELLS } from "./stream-buffer.js";
+import { applyEdit, classifyKey, lineBounds, nextIndex, prevIndex, type EditAction, type EditorState } from "./line-edit.js";
 
-export interface EditorState {
-  value: string;
-  cursor: number;
-}
+export type { EditorState } from "./line-edit.js";
 
 export interface PromptProps {
   state: EditorState;
@@ -97,13 +95,6 @@ export function moveVisual(s: EditorState, columns: number, dir: -1 | 1): Editor
   return { ...s, cursor };
 }
 
-function lineBounds(value: string, cursor: number) {
-  const start = value.lastIndexOf("\n", cursor - 1) + 1;
-  let end = value.indexOf("\n", cursor);
-  if (end === -1) end = value.length;
-  return { start, end };
-}
-
 export function onFirstLine(s: EditorState) {
   return s.value.lastIndexOf("\n", s.cursor - 1) === -1;
 }
@@ -125,6 +116,10 @@ export function moveVertical(s: EditorState, dir: -1 | 1): EditorState {
   return { ...s, cursor: Math.min(next.start + col, next.end) };
 }
 
+/** Text removed by the kill commands (Ctrl+K/U/W, word deletes), for Ctrl+Y.
+ *  Shared by every prompt, like a terminal's kill ring. */
+let killed = "";
+
 function insert(s: EditorState, text: string): EditorState {
   return { value: s.value.slice(0, s.cursor) + text + s.value.slice(s.cursor), cursor: s.cursor + text.length };
 }
@@ -136,10 +131,73 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
   // React re-renders, so edits build on the latest state kept here, not the possibly stale prop.
   const latest = useRef(propState);
   latest.current = propState;
-  const onChange = (s: EditorState) => {
+  // Undo history. Typing within a word is one step; a change made outside
+  // this editor (history recall, sending) starts a fresh history.
+  const undo = useRef<EditorState[]>([]);
+  const redo = useRef<EditorState[]>([]);
+  const lastKind = useRef<string>("");
+  const ownValue = useRef(propState.value);
+  if (propState.value !== ownValue.current) {
+    undo.current = [];
+    redo.current = [];
+    lastKind.current = "";
+    ownValue.current = propState.value;
+  }
+  type Kind = "type" | "edit" | "kill-back" | "kill-forward" | "move" | "history";
+  const onChange = (s: EditorState, kind: Kind = "edit") => {
+    const prev = latest.current;
+    if (s.value !== prev.value && kind !== "history") {
+      const sameWord = kind === "type" && lastKind.current === "type" && !/\s$/.test(prev.value.slice(0, prev.cursor));
+      if (!sameWord) {
+        undo.current.push(prev);
+        if (undo.current.length > 200) undo.current.shift();
+      }
+      redo.current = [];
+    }
+    if (kind !== "history") lastKind.current = kind;
     latest.current = s;
+    ownValue.current = s.value;
     propOnChange(s);
   };
+  const edit = (action: EditAction, state: EditorState) => {
+    if (action === "yank") {
+      if (killed) onChange(insert(state, mask ? killed.replace(/\s+/g, "") : killed));
+      return;
+    }
+    if (action === "undo" || action === "redo") {
+      const from = action === "undo" ? undo.current : redo.current;
+      const to = action === "undo" ? redo.current : undo.current;
+      const target = from.pop();
+      if (!target) return;
+      to.push(state);
+      lastKind.current = "";
+      onChange(target, "history");
+      return;
+    }
+    const r = applyEdit(action, state);
+    if (r.killed !== undefined) {
+      const back = r.state.cursor < state.cursor || action === "deleteToLineStart" || action === "deleteWordBack" || action === "deleteBigWordBack";
+      const kind = back ? "kill-back" : "kill-forward";
+      // Consecutive kills collect into one piece of text, as in readline.
+      killed = lastKind.current.startsWith("kill") ? (back ? r.killed + killed : killed + r.killed) : r.killed;
+      onChange(r.state, kind);
+      return;
+    }
+    if (r.state.value === state.value && r.state.cursor === state.cursor) return;
+    onChange(r.state, r.state.value === state.value ? "move" : "edit");
+  };
+  // Ink's key events drop what tells Ctrl+← from ←, or Delete from
+  // Backspace; the raw sequence of the key being handled is kept here.
+  // This listener is added before useInput's, so it always runs first.
+  const { internal_eventEmitter: inputEvents } = useStdin();
+  const raw = useRef("");
+  useEffect(() => {
+    const onRaw = (data: string) => (raw.current = data);
+    inputEvents.on("input", onRaw);
+    return () => {
+      inputEvents.off("input", onRaw);
+    };
+  }, [inputEvents]);
   // Inside a bracketed paste (ESC[200~ … ESC[201~), Enter is a newline, never "send".
   const pasting = useRef(false);
 
@@ -170,6 +228,9 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
         onSubmitNow(state.value);
         return;
       }
+      const action = classifyKey(raw.current);
+      raw.current = "";
+      if (action) return edit(action, state);
       if (onSpecialKey?.(key, input, state)) return;
       const { value, cursor } = state;
 
@@ -187,19 +248,25 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
         return;
       }
       if (key.ctrl) {
-        const { start, end } = lineBounds(value, cursor);
-        if (input === "a") return onChange({ ...state, cursor: start });
-        if (input === "e") return onChange({ ...state, cursor: end });
-        if (input === "u") return onChange({ value: value.slice(0, start) + value.slice(cursor), cursor: start });
-        if (input === "k") return onChange({ value: value.slice(0, cursor) + value.slice(end), cursor });
-        if (input === "w") {
-          const before = value.slice(0, cursor).replace(/\S+\s*$/, "");
-          return onChange({ value: before + value.slice(cursor), cursor: before.length });
-        }
+        if (input === "a") return edit("lineStart", state);
+        if (input === "e") return edit("lineEnd", state);
+        if (input === "u") return edit("deleteToLineStart", state);
+        if (input === "k") return edit("deleteToLineEnd", state);
+        if (input === "w") return edit("deleteBigWordBack", state);
+        if (input === "d" && value) return edit("deleteCharForward", state);
+        // Ctrl with an arrow or Delete the terminal encoded some other way.
+        if (key.leftArrow) return edit("wordLeft", state);
+        if (key.rightArrow) return edit("wordRight", state);
+        if (key.delete || key.backspace) return edit("deleteWordBack", state);
         return;
       }
-      if (key.leftArrow) return onChange({ ...state, cursor: Math.max(0, cursor - 1) });
-      if (key.rightArrow) return onChange({ ...state, cursor: Math.min(value.length, cursor + 1) });
+      if (key.meta && !key.escape) {
+        if (key.leftArrow) return edit("wordLeft", state);
+        if (key.rightArrow) return edit("wordRight", state);
+        if (key.delete || key.backspace) return edit("deleteWordBack", state);
+      }
+      if (key.leftArrow) return onChange({ ...state, cursor: prevIndex(value, cursor) }, "move");
+      if (key.rightArrow) return onChange({ ...state, cursor: nextIndex(value, cursor) }, "move");
       if (key.home) return onChange({ ...state, cursor: lineBounds(value, cursor).start });
       if (key.end) return onChange({ ...state, cursor: lineBounds(value, cursor).end });
       if (key.upArrow) return onChange(moveVisual(state, textColumns, -1));
@@ -207,7 +274,8 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
       // Most terminals send DEL (0x7f) for Backspace, which Ink reports as `delete`.
       if (key.backspace || key.delete) {
         if (cursor === 0) return;
-        return onChange({ value: value.slice(0, cursor - 1) + value.slice(cursor), cursor: cursor - 1 });
+        const from = prevIndex(value, cursor);
+        return onChange({ value: value.slice(0, from) + value.slice(cursor), cursor: from });
       }
       if (key.escape || key.tab || key.pageUp || key.pageDown) return;
       if (!input) return;
@@ -215,7 +283,7 @@ export function Prompt({ state: propState, onChange: propOnChange, onSubmit, onS
       // Pasted text arrives as one chunk; normalise its line endings and strip control chars.
       let text = input.replace(/\r\n?/g, "\n").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
       if (mask) text = text.replace(/\s+/g, "");
-      if (text) onChange(insert(state, text));
+      if (text) onChange(insert(state, text), "type");
     },
     { isActive },
   );

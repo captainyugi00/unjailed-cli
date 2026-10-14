@@ -411,9 +411,18 @@ answer Chrome, so the agent can read pages that `curl` or a plain `fetch` can't.
 | Shift+Enter, or `\` then Enter | New line. Alt+Enter and Ctrl+J also work, for terminals that don't report Shift+Enter. |
 | ↑ / ↓ | Move between the rows of your draft, including the rows of a long wrapped line; on the first or last row they step through previous inputs |
 | ← / →, Home / End | Move the cursor; Home/End jump to the start/end of the line |
-| Ctrl+A / Ctrl+E | Jump to the start / end of the line |
-| Ctrl+U / Ctrl+K | Delete to the start / end of the line |
-| Ctrl+W | Delete the previous word |
+| Ctrl+← / Ctrl+→ | Jump to the previous / next word. Alt+←/→ (Option+←/→ on macOS) and readline's Alt+B / Alt+F do the same. Words stop at spaces and punctuation, so `foo.bar` is two words. |
+| Ctrl+A / Ctrl+E | Jump to the start / end of the line (also Cmd+←/→ in terminals that pass Cmd through, such as kitty, Ghostty and WezTerm) |
+| Ctrl+Home / Ctrl+End | Jump to the start / end of the whole message (also Alt+< / Alt+>) |
+| Ctrl+Backspace / Alt+Backspace | Delete the previous word |
+| Ctrl+Delete / Alt+Delete / Alt+D | Delete the next word |
+| Delete, Ctrl+D | Delete the character after the cursor (Ctrl+D on an empty input exits) |
+| Ctrl+U / Ctrl+K | Delete to the start / end of the line; at a line edge they join it with the next one |
+| Ctrl+W | Delete back to the previous space |
+| Ctrl+Y | Paste back what the last delete removed; deletes made in a row are pasted back together |
+| Ctrl+Z, Ctrl+_ / Ctrl+Shift+Z | Undo / redo. Typing a word undoes as one step. |
+| Alt+U / Alt+L / Alt+C | Uppercase / lowercase / capitalize the next word |
+| Alt+T | Swap the words around the cursor |
 | Space | Toggle a skill in `/skills` |
 | Paste | Multi-line pastes stay in the input box; they're never sent until you press Enter |
 | Esc | Close menus. While a turn is running, press Esc **twice** to stop it (the first press arms it, so a stray Esc won't kill a long run). This also stops subagents, workflows and retry waits. |
@@ -492,7 +501,7 @@ MIT · [github.com/unjailedai/unjailedCLI](https://github.com/unjailedai/unjaile
 
 ### Unreleased
 
-`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish. `web_fetch` now goes through [wreq](#web-fetching) with real browser fingerprints, readable-text extraction, bot-challenge retries and paging.
+`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish. `web_fetch` now goes through [wreq](#web-fetching) with real browser fingerprints, readable-text extraction, bot-challenge retries and paging. The input box has word-level editing: Ctrl/Alt+arrows, Ctrl+Backspace / Ctrl+Delete, a kill buffer (Ctrl+Y), undo/redo and the other readline [keys](#keys).
 
 ### Coding reliability (0.12.4)
 
