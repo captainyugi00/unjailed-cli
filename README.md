@@ -445,6 +445,9 @@ answer Chrome, so the agent can read pages that `curl` or a plain `fetch` can't.
 | `UNJAILED_REASONING_TIMEOUT` | Seconds a stream may produce only reasoning, with no answer or tool call, before it stops (default 180) |
 | `UNJAILED_AUTOSAVE_SECONDS` | How often the open chat is autosaved, idle or mid-run, in seconds (default 10, minimum 1) |
 | `UNJAILED_NO_HISTORY` | Set to `1` (any value except `0`/`false`) to stop saving chats (disables `/resume`); `"saveSessions": false` in config.json does the same |
+| `UNJAILED_MAX_OLD_SPACE` | V8 heap limit in MB. By default the CLI re-execs once with `--max-old-space-size` set to about 75% of system RAM (minimum 2 GB), so a long session can keep its whole history in memory instead of hitting Node's ~2 GB default and crashing with "heap out of memory". Set this to pin an exact limit. |
+| `UNJAILED_NO_HEAP_TUNE` | Set to `1` to skip the heap re-exec and keep Node's default limit (also skipped automatically if you set `--max-old-space-size` in `NODE_OPTIONS`). |
+| `UNJAILED_MAX_STREAM_MB` | Largest a single model response may grow (default 64 MB). A reply that runs past it — a model stuck looping — is cut off and resumed rather than filling memory; it never truncates saved history. |
 | `UNJAILED_FETCH_PYTHON` | A Python that already has `wreq` installed, used by `web_fetch` instead of the private environment |
 | `UNJAILED_FETCH_ENGINE` | Set to `node` to fetch with Node's built-in `fetch` instead of wreq |
 | `UNJAILED_NO_FX` | Set to `1` or `true` to turn off the fun effects (wink, snow, sparkle) |
@@ -489,6 +492,13 @@ The default API URL is set in `src/constants.ts` (`DEFAULT_BASE_URL`).
   rendering, completed output outside Ink's growing static cache, async
   append-only saves, older exact excerpts and recoverable tool history.
   `/remember` pins critical instructions; `/context` shows request usage.
+- **Heap exhaustion in very long sessions (customer report, October 16, 2026):**
+  a 7-hour session holding its full history crashed at Node's default ~2 GB
+  heap limit. The CLI now re-execs once at startup with `--max-old-space-size`
+  scaled to the machine's RAM (about 75%, minimum 2 GB), so history is never
+  trimmed to fit; a per-response byte budget (`UNJAILED_MAX_STREAM_MB`, default
+  64 MB) stops any single runaway stream from filling memory. Opt out with
+  `UNJAILED_NO_HEAP_TUNE=1`.
 - Model/server latency and model reasoning accuracy still vary. Context is
   finite; automatic excerpts select relevant portions, and a model may need
   to use `search_history` for an older detail. Very large completed responses
@@ -501,7 +511,7 @@ MIT · [github.com/unjailedai/unjailedCLI](https://github.com/unjailedai/unjaile
 
 ### Unreleased
 
-`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish. `web_fetch` now goes through [wreq](#web-fetching) with real browser fingerprints, readable-text extraction, bot-challenge retries and paging. The input box has word-level editing: Ctrl/Alt+arrows, Ctrl+Backspace / Ctrl+Delete, a kill buffer (Ctrl+Y), undo/redo and the other readline [keys](#keys).
+`/goal` and `/loop` keep the agent working toward a condition or on an interval; the agent can run subagents and saved multi-agent workflows (`/workflow`, `/workflows`). `/verbose` (Ctrl+O) shows thinking, subagent steps and full tool output. `/stats` and `/agents` report per-turn and per-session numbers. Chats are saved continuously (every `UNJAILED_AUTOSAVE_SECONDS`, default 10), so `/resume` or `unjailed -c` restores an interrupted run in full. Slash commands run immediately while the agent works, except `/clear`, `/resume`, `/sessions`, `/login`, `/logout`, `/update` and running a workflow, which wait for the turn to finish. `web_fetch` now goes through [wreq](#web-fetching) with real browser fingerprints, readable-text extraction, bot-challenge retries and paging. Long sessions are no longer capped at Node's ~2 GB default heap: the CLI sizes its heap to the machine so full history stays in memory, and a per-response budget stops a single runaway stream from exhausting it. The input box has word-level editing: Ctrl/Alt+arrows, Ctrl+Backspace / Ctrl+Delete, a kill buffer (Ctrl+Y), undo/redo and the other readline [keys](#keys).
 
 ### Coding reliability (0.12.4)
 

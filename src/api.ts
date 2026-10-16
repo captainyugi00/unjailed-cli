@@ -1,5 +1,5 @@
 import { archivedContext, identifyHistoryEntry, isWorkingContext, protectWorkingContext } from "./context.js";
-import { REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, REASONING_TIMEOUT_MS, VERSION } from "./constants.js";
+import { REQUEST_TIMEOUT_MS, STREAM_IDLE_TIMEOUT_MS, REASONING_TIMEOUT_MS, MAX_STREAM_BYTES, VERSION } from "./constants.js";
 
 export type Role = "system" | "user" | "assistant";
 export interface ChatMessage {
@@ -405,6 +405,8 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
   let reasoningTimer: NodeJS.Timeout | undefined;
   let reasoningTimedOut = false;
   let productive = false; // an answer or a tool call has started
+  let oversized = false; // a single response grew past the stream budget
+  let streamedBytes = 0;
   const toolAccum = new Map<number, ToolCallAccum>();
   let finishReason: string | null = null;
   let usage: Usage | undefined;
@@ -477,6 +479,12 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
       const { value, done } = await reader.read();
       // Don't rely on the abort alone to end the body: stop reading once a timer fired.
       if (reasoningTimedOut || idleTimedOut) throw new Error("timed out");
+      if (oversized) throw new Error("oversized");
+      if (!done && value) {
+        // A runaway response (a model looping forever) must never fill the heap.
+        streamedBytes += value.byteLength;
+        if (streamedBytes > MAX_STREAM_BYTES) { oversized = true; controller.abort(); }
+      }
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       if (!done) armIdle();
       let nl: number;
@@ -495,9 +503,12 @@ async function readCompletion(res: Response, controller: AbortController, baseUr
       }
     }
   } catch (err) {
-    if (signal.aborted) throw new AbortedError();
+    if (signal.aborted && !oversized) throw new AbortedError();
     if (reasoningTimedOut) throw new ApiError("The model produced no answer or tool call within the reasoning deadline. Completed work remains saved. Try /effort low or another model.", undefined, undefined, true, { code: "reasoning-deadline" });
     if (idleTimedOut) throw new ApiError("The response stalled and timed out. Try again.");
+    // A single response ran past the stream budget (a stuck/looping model):
+    // transient, so the agent loop resumes from what already arrived.
+    if (oversized) throw new ApiError(`The response exceeded ${Math.round(MAX_STREAM_BYTES / (1024 * 1024))} MB without ending — it was cut off and will resume. Raise UNJAILED_MAX_STREAM_MB if a reply is legitimately this large.`, undefined, undefined, false, { retryable: true });
     throw networkError(err, baseUrl, false);
   } finally {
     clearTimeout(idle);

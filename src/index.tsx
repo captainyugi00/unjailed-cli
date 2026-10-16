@@ -7,6 +7,7 @@ import { fxEnabled } from "./ui/fx.js";
 import { VERSION } from "./constants.js";
 import { configPath } from "./config.js";
 import { settleWrites } from "./sessions.js";
+import { ensureHeadroom } from "./heap.js";
 
 const args = process.argv.slice(2);
 
@@ -38,12 +39,23 @@ Environment
   UNJAILED_REASONING_TIMEOUT  no-answer/tool-call deadline in seconds (default 180)
   UNJAILED_AUTOSAVE_SECONDS  autosave interval in seconds for the open chat (default 10)
   UNJAILED_NO_HISTORY set to 1 to stop saving chats (disables /resume)
+  UNJAILED_MAX_OLD_SPACE  V8 heap limit in MB (default: ~75% of RAM so long chats keep their full history)
+  UNJAILED_NO_HEAP_TUNE  set to 1 to keep Node's default ~2 GB heap limit
+  UNJAILED_MAX_STREAM_MB  cap on a single response before it's cut off and resumed (default 64)
   UNJAILED_NO_FX      set to 1 to turn off the fun effects (wink, snow)
   NO_COLOR            disable colors
   FORCE_COLOR         force a color level (0 off, 1 basic, 2 256 colors, 3 truecolor)
 
 Config: ${configPath()}`);
   process.exit(0);
+}
+
+// A long session keeps its whole history in memory; on a machine with the RAM
+// to spare, give the CLI a heap bigger than V8's ~2 GB default by re-exec'ing
+// once (see ensureHeadroom). Done before the TTY is touched so the child owns it.
+{
+  const code = ensureHeadroom();
+  if (code !== null) process.exit(code);
 }
 
 if (!process.stdin.isTTY) {

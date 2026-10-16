@@ -28,3 +28,10 @@ export const VERSION: string = (() => {
 
 const reasoningSeconds = Number(process.env.UNJAILED_REASONING_TIMEOUT);
 export const REASONING_TIMEOUT_MS = (Number.isFinite(reasoningSeconds) && reasoningSeconds > 0 ? reasoningSeconds : 180) * 1000;
+
+// A single response must not grow without bound: a model that loops forever
+// emitting tokens or tool-call arguments would otherwise fill the heap. This
+// is far above any legitimate reply (even a 200 KB file write), and a stream
+// that exceeds it is cut off and resumed, never truncating saved history.
+const streamCapMB = Number(process.env.UNJAILED_MAX_STREAM_MB);
+export const MAX_STREAM_BYTES = (Number.isFinite(streamCapMB) && streamCapMB > 0 ? streamCapMB : 64) * 1024 * 1024;
